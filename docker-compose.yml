@@ -1,0 +1,46 @@
+# Deploy target: /data/compose/immich-ai-classifier/docker-compose.yml on your
+# Docker host. App data lives under the host dir APP_DATA_HOST_PATH points at
+# (default /opt/appdata/immich-ai-classifier).
+#
+# Variable substitution below ($LOCAL_MOUNT, $IMMICH_LIBRARY_HOST_PATH,
+# $APP_DATA_HOST_PATH) is read by docker-compose from the .env file in this same
+# directory, so the mount target and the value the app sees stay in sync.
+
+name: immich-ai-classifier
+
+services:
+  immich-ai-classifier:
+    build: .
+    image: immich-ai-classifier:latest
+    container_name: immich-ai-classifier
+    # All settings come from .env (loaded once at startup). CATEGORIES_FILE is
+    # optional there — left unset, the app uses the mounted categories.yaml below.
+    env_file:
+      - .env
+    volumes:
+      # READ-ONLY bind-mount of the Immich UPLOAD_LOCATION. The ':ro' is
+      # mandatory — this project never writes to Immich storage (checksum/size
+      # desync). That host directory (IMMICH_LIBRARY_HOST_PATH, e.g.
+      # /path/to/immich/library) is the same dir Immich mounts to
+      # /usr/src/app/upload internally.
+      - "${IMMICH_LIBRARY_HOST_PATH}:${LOCAL_MOUNT}:ro"
+      # Writable app data (state, logs, the SQLite cache).
+      - "${APP_DATA_HOST_PATH:-/opt/appdata/immich-ai-classifier}:/data"
+      # User-editable category taxonomy, mounted read-only OVER the copy baked
+      # into the image. Edit config/categories.yaml here to change the
+      # categories / review / source rules without rebuilding.
+      - "./config:/app/config:ro"
+    networks:
+      # Join the Immich stack's network so we can reach the API container to
+      # container as http://immich_server:2283 — no reverse proxy, no TLS.
+      - immich
+    # Foundation stage is a run-to-completion verify tool, not a daemon.
+    restart: "no"
+
+networks:
+  # Immich's compose has `name: immich`, so its default network is
+  # `immich_default`. We attach to it as an external network. Verify the exact
+  # name on the host if attach fails:  docker network ls | grep immich
+  immich:
+    external: true
+    name: immich_default

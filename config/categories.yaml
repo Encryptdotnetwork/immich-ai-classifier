@@ -1,0 +1,90 @@
+# Immich AI Classifier — category taxonomy (THE single source of truth).
+#
+# Edit this file to change how assets are classified. You do NOT edit any prompt
+# text in code — the prompt machinery (JSON contract, confidence/tag rules,
+# source-detection instruction) is fixed in app/taxonomy.py and INJECTS the
+# categories below. Restart the app after editing (the config is loaded once at
+# startup). Override the path with the CATEGORIES_FILE env var.
+#
+# Each category: name (required), description (required), notes (optional
+# disambiguation — this is where intent emphasis lives now), examples (optional).
+# Exactly ONE category must have `catch_all: true` (the fallback).
+
+marker_tag: ai-classified
+
+review:
+  threshold: 0.70        # confidence below this routes to the review album
+  album_name: _Review    # NOT one of the categories below
+  tag_name: needs-review
+
+source_detection:
+  enabled: true
+  tag_sources: true      # add a `source:<platform>` tag (e.g. source:tiktok)
+  process_only: null      # e.g. `tiktok` -> only FILE assets detected as tiktok
+                          # (others are skipped and reported, never silently dropped)
+
+categories:
+  - name: Trading
+    description: >-
+      Teaches a REPEATABLE METHOD — entry/exit rules, chart setups, indicators,
+      risk management, position sizing, timeframes.
+    notes: >-
+      Focus is HOW to trade; asset class is irrelevant (crypto, stocks, forex all
+      count if a method is taught). The Trading vs Crypto call is the most
+      important one — decide by INTENT, a chart on screen does NOT decide it.
+      "It's going up, get in now" = Crypto. "Wait for the candle to close above
+      resistance, stop below the low" = Trading.
+    examples: [chart-setup walkthrough, risk-management rules, entry/exit checklist]
+
+  - name: Crypto
+    description: >-
+      Price HYPE, coin shilling, "this will moon", price predictions, buy/sell
+      calls, market commentary WITHOUT a teachable method.
+    notes: >-
+      Focus is WHICH coin / WHAT price, not how to trade. If a repeatable method
+      is taught it is Trading, not Crypto.
+
+  - name: Food
+    description: Recipes, cooking, restaurants, food reviews.
+
+  - name: Gaming
+    description: Video games, gameplay, gaming news, setups.
+
+  - name: Tech
+    description: Hardware, software, gadgets, IT, programming, networking.
+
+  - name: Health
+    description: PHYSICAL only — fitness, nutrition, exercise, medical, sleep.
+    notes: Health is body; Self-improvement is mind. Mental/behavioural content goes to Self-improvement.
+
+  - name: History
+    description: Settled historical events, facts, documentary-style content.
+    notes: >-
+      Keep-forever history. If it is current affairs that will go stale, it is
+      Geopolitics, not History.
+
+  - name: Geopolitics
+    description: >-
+      Current-affairs geopolitics — ongoing wars and conflicts, elections,
+      foreign policy, diplomacy, breaking world events and analysis of them.
+    notes: >-
+      Distinct from History by RECENCY / LIFECYCLE: current-affairs content that
+      goes stale and may later be deleted, versus settled keep-forever history.
+      A whiteboard geo-strategy breakdown of an ONGOING conflict is Geopolitics;
+      a documentary on a concluded historical war is History.
+    examples: [conflict map breakdown, election analysis, foreign-policy explainer]
+
+  - name: Jokes/Memes
+    description: Comedy, memes, skits, entertainment with no informational aim.
+
+  - name: Anime
+    description: Anime, animation, "what anime is this" clips, anime recommendations.
+    notes: Use tags like "tv-show" or "film" for non-anime video rather than this category.
+
+  - name: Self-improvement
+    description: MENTAL/behavioural — productivity, mindset, habits, career, learning, discipline.
+    notes: Self-improvement is mind; Health is body.
+
+  - name: General
+    description: Anything that does not clearly fit another category.
+    catch_all: true

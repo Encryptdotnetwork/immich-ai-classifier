@@ -1,0 +1,8 @@
+requests==2.32.3
+python-dotenv==1.0.1
+# Video frame extraction (signals.py, video assets only). Pillow encodes frames
+# to JPEG; MoviePy needs the ffmpeg binary (installed in the Dockerfile).
+Pillow==10.4.0
+moviepy==1.0.3
+# Category taxonomy config (config/categories.yaml -> app/taxonomy.py).
+PyYAML==6.0.2
