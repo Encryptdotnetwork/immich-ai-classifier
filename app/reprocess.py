@@ -137,7 +137,7 @@ def run_reprocess(
                 print(f"  [WARN] overriding human-edited ({reason}): {asset_id}")
 
             # Cache override: always classify within scope.
-            result = classify_asset(asset, cfg, vision)
+            result = classify_asset(asset, cfg, vision, client)
 
             # Source filter: visibly skip assets whose detected source doesn't
             # match process_only (never silently dropped).

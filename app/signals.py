@@ -15,10 +15,20 @@ import io
 import os
 from typing import Any, Optional
 
+import requests
+
 from .config import Config
+from .immich_client import ImmichClient
 from .paths import translate_path
 
 NUM_VIDEO_FRAMES = 5
+
+# iPhone HEIC/HEIF originals cannot be decoded by the vision endpoint (Ollama /
+# qwen3-vl and, sometimes, the remote model), which returns HTTP 400 "Failed to
+# load image or audio file". For these we fetch the Immich-generated JPEG preview
+# instead of the original file (see gather_signals / [[immich-classifier...]]).
+_HEIC_EXTENSIONS = (".heic", ".heif", ".hif")
+_HEIC_MIME_TYPES = ("image/heic", "image/heif")
 
 
 class SignalError(RuntimeError):
@@ -72,6 +82,34 @@ def _image_b64(local_path: str) -> str:
         return base64.b64encode(fh.read()).decode("ascii")
 
 
+def _is_heic(asset: dict[str, Any]) -> bool:
+    """True for HEIC/HEIF assets — detected by MIME first, then file extension.
+
+    We keep the fast read-local path for JPEG/PNG (which already work) and only
+    reroute HEIC/HEIF through the API preview, which is what the vision endpoint
+    chokes on.
+    """
+    mime = (asset.get("originalMimeType") or "").lower()
+    if mime in _HEIC_MIME_TYPES:
+        return True
+    name = (asset.get("originalFileName") or asset.get("originalPath") or "").lower()
+    return name.endswith(_HEIC_EXTENSIONS)
+
+
+def _preview_b64(asset: dict[str, Any], client: ImmichClient) -> str:
+    """Fetch the Immich JPEG preview for an asset and base64-encode it."""
+    asset_id = asset.get("id")
+    try:
+        jpeg = client.get_thumbnail(asset_id, size="preview")
+    except requests.exceptions.RequestException as exc:
+        raise SignalError(
+            f"Could not fetch Immich preview for asset {asset_id}: {exc}"
+        ) from exc
+    if not jpeg:
+        raise SignalError(f"Immich returned an empty preview for asset {asset_id}.")
+    return base64.b64encode(jpeg).decode("ascii")
+
+
 def _extract_frames(local_path: str, num_frames: int = NUM_VIDEO_FRAMES) -> list[str]:
     """Extract evenly-spaced JPEG frames as base64. Lazy imports so the image
     path never depends on MoviePy/Pillow/ffmpeg being present."""
@@ -100,16 +138,22 @@ def _extract_frames(local_path: str, num_frames: int = NUM_VIDEO_FRAMES) -> list
         clip.close()
 
 
-def gather_signals(asset: dict[str, Any], cfg: Config) -> dict[str, Any]:
+def gather_signals(
+    asset: dict[str, Any], cfg: Config, client: ImmichClient
+) -> dict[str, Any]:
     """Build the model-ready signal bundle for one asset.
 
     Returns:
         {asset_id, type, image_b64 | frames, ocr_text, transcript}
         - image assets: ``image_b64`` set, ``frames`` None.
         - video assets: ``frames`` set (list of base64 JPEGs), ``image_b64`` None.
+
+    Read strategy: JPEG/PNG images and videos are read straight off the read-only
+    mount (fast, full resolution — preserves text for OCR-style screenshots).
+    HEIC/HEIF images are pulled from the Immich JPEG preview via the API instead,
+    because the vision endpoint cannot decode HEIC originals and returns HTTP 400.
     """
     asset_type = asset.get("type")
-    local_path = _read_local_file(asset, cfg)
 
     ocr_value, _where = find_ocr_text(asset)
     ocr_text = ocr_value or None  # treat empty string as absent
@@ -124,8 +168,11 @@ def gather_signals(asset: dict[str, Any], cfg: Config) -> dict[str, Any]:
     }
 
     if asset_type == "VIDEO":
-        signals["frames"] = _extract_frames(local_path)
-    else:  # treat anything non-VIDEO as an image
-        signals["image_b64"] = _image_b64(local_path)
+        signals["frames"] = _extract_frames(_read_local_file(asset, cfg))
+    elif _is_heic(asset):
+        # No local read: the HEIC original is exactly what the model can't decode.
+        signals["image_b64"] = _preview_b64(asset, client)
+    else:  # JPEG/PNG/etc — keep the working read-local fast path.
+        signals["image_b64"] = _image_b64(_read_local_file(asset, cfg))
 
     return signals

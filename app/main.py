@@ -151,7 +151,7 @@ def _run_classify(cfg: Config, client: ImmichClient, asset_id: str, commit: bool
     print("-" * 72)
 
     try:
-        result = classify_asset(asset, cfg, VisionClient(cfg.vision))
+        result = classify_asset(asset, cfg, VisionClient(cfg.vision), client)
     except (VisionError, SignalError) as exc:
         print(f"!! {exc}", file=sys.stderr)
         return 1

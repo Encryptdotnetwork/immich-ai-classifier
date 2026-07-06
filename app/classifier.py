@@ -120,9 +120,15 @@ def _select_image_bytes(signals: dict[str, Any]) -> bytes:
     )
 
 
-def classify_asset(asset: dict[str, Any], cfg: Config, vision_client: Any) -> dict[str, Any]:
-    """Gather signals, run the vision model, parse the result. NO writes."""
-    signals = gather_signals(asset, cfg)
+def classify_asset(
+    asset: dict[str, Any], cfg: Config, vision_client: Any, client: Any
+) -> dict[str, Any]:
+    """Gather signals, run the vision model, parse the result. NO writes.
+
+    ``client`` is the ImmichClient — needed so signal gathering can fetch the
+    JPEG preview for HEIC/HEIF assets the vision endpoint can't decode.
+    """
+    signals = gather_signals(asset, cfg, client)
     image_bytes = _select_image_bytes(signals)
     ocr_text = signals.get("ocr_text")
 

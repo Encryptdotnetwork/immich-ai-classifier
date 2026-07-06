@@ -351,7 +351,7 @@ def test_batch_dryrun() -> None:
                "parse_ok": True, "category_valid": True, "raw_category": "Crypto"},
     }
     orig = batch_mod.classify_asset
-    batch_mod.classify_asset = lambda asset, c, v: dict(canned[asset["id"]])
+    batch_mod.classify_asset = lambda asset, c, v, cl: dict(canned[asset["id"]])
     try:
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -396,7 +396,7 @@ def test_reprocess_dryrun() -> None:
     )
 
     orig = reprocess_mod.classify_asset
-    reprocess_mod.classify_asset = lambda asset, c, v: {
+    reprocess_mod.classify_asset = lambda asset, c, v, cl: {
         "category": "Gaming", "source": "tiktok", "tags": ["fps"], "confidence": 0.9,
         "parse_ok": True, "category_valid": True, "raw_category": "Gaming",
     }

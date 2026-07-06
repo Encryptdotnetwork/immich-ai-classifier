@@ -66,6 +66,20 @@ class ImmichClient:
         """GET /api/assets — asset list. Optional query params pass through."""
         return self._get("assets", params=params or None)
 
+    def get_thumbnail(self, asset_id: str, size: str = "preview") -> bytes:
+        """GET /api/assets/{id}/thumbnail?size=preview — the Immich-rendered JPEG.
+
+        Returns raw bytes (NOT JSON, so it bypasses _request's JSON handling).
+        Immich generates a JPEG preview for every asset regardless of the
+        original format, so this is the reliable way to feed the vision endpoint
+        formats it cannot decode itself — notably iPhone HEIC/HEIF originals,
+        which fail with HTTP 400 'Failed to load image or audio file'.
+        """
+        url = f"{self._base}/assets/{asset_id}/thumbnail"
+        resp = self._session.get(url, params={"size": size}, timeout=self._timeout)
+        resp.raise_for_status()
+        return resp.content
+
     def get_tags(self) -> Any:
         """GET /api/tags — all tags (flat list with id/name/value)."""
         return self._get("tags")

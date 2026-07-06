@@ -284,7 +284,7 @@ def run_batch(cfg: Config, client: ImmichClient, *, commit: bool, limit: Optiona
                 print(f"  [skip] {asset_id}  human-touched — left untouched")
                 continue
 
-            result = classify_asset(asset, cfg, vision)
+            result = classify_asset(asset, cfg, vision, client)
 
             # Source filter: visibly skip assets whose detected source doesn't
             # match process_only (never silently dropped).
