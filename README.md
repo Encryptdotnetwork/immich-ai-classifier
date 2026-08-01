@@ -37,6 +37,7 @@ app/
   cache.py          # SQLite cache (skip unchanged, detect human moves)
   batch.py          # enumerate album, guard, route (review/source), group-write
   reprocess.py      # scoped re-classify with MOVE-NOT-ADD (remove-from-old)
+  dedupe_albums.py  # maintenance: merge duplicate same-named albums
   main.py           # entrypoint: verify, --classify, --commit, --batch, --reprocess
 config/
   categories.yaml   # THE taxonomy: categories, review machinery, marker tag, source detection
@@ -205,21 +206,38 @@ docker compose run --rm immich-ai-classifier python -m app.main --classify <asse
 docker compose run --rm immich-ai-classifier python -m app.main --commit <asset_id>
 ```
 
-Built against two confirmed, still-open Immich tagging bugs:
-- It returns **HTTP 200 before the tag persists** (#23861).
+Built against confirmed, still-open Immich write bugs:
+- Tagging returns **HTTP 200 before the tag persists** (#23861).
 - bulkTagAssets can **silently tag only some assets** while reporting success
   (#16747).
+- **Description and tags clobber each other.** A description write
+  (`PUT /api/assets/{id}`) can wipe tags, and a tag write can blank the
+  description — whichever lands last wins. A fixed write ORDER cannot satisfy
+  both, and trying produces results that flip-flop between runs on the same
+  asset (tags all present, description empty, or the reverse).
 
 So the **success signal is a re-read of the asset, never the HTTP status**.
 Writer behaviour:
-- Tags applied in ONE `bulkTagAssets` call, then a verify-and-retry loop
-  (`TAG_VERIFY_MAX_RETRIES`, `TAG_VERIFY_DELAY`): re-fetch the asset, re-tag only
-  the misses, repeat; if still missing after the retries it reports **FAIL**
-  with the missing tags — it never silently passes.
-- Description is written via `PUT /api/assets/{id}` (singular) **before** tagging
-  and is not interleaved with tag writes (a description write can wipe tags).
+- Tags applied in ONE `bulkTagAssets` call and the description via
+  `PUT /api/assets/{id}` (singular), then a **single repair loop**
+  (`TAG_VERIFY_MAX_RETRIES`, `TAG_VERIFY_DELAY`) re-reads the asset and rewrites
+  **only the field that came back wrong**, until tags and description hold
+  together in one snapshot. Rewriting a field that is already correct would just
+  clobber the other one again. If it still fails after the retries it reports
+  **FAIL** with the missing tags — it never silently passes.
+- Non-zero `verify-retries` in a run summary is normal and means the repair loop
+  did its job; it is not an error count.
+- **Album membership is verified from the ASSET side**
+  (`GET /api/albums?assetId=`), never by re-reading the album and scanning its
+  asset list. The album-side read is capped and would false-negative a write
+  that actually landed (and, on the removal path, false-positive a removal that
+  did not happen).
 - Album + tags are create-or-reuse by name, so re-running `--commit` produces no
-  duplicate tags or album membership and does not error.
+  duplicate tags or album membership and does not error. Immich permits two
+  albums to share a NAME, so callers processing many assets pass a live
+  `album_ids` map into `execute_plan`; without it, an album created mid-run is
+  absent from the caller's prefetched list and every later asset in that
+  category creates ANOTHER album of the same name.
 - Tag normalisation: **slug-style** — lowercase, and every run of
   non-alphanumeric chars becomes a single hyphen (`Bang Bang Chicken` ->
   `bang-bang-chicken`). Source tags (`source:tiktok`) are kept **literal** (the
@@ -241,6 +259,9 @@ docker compose run --rm immich-ai-classifier python -m app.main --batch --commit
 
 # Whole album:
 docker compose run --rm immich-ai-classifier python -m app.main --batch --commit
+
+# Skip anything already carrying a source:<platform> tag:
+docker compose run --rm immich-ai-classifier python -m app.main --batch --commit --skip-sourced
 ```
 
 Key behaviours:
@@ -259,6 +280,12 @@ Key behaviours:
 - **Source filter:** if `source_detection.process_only` is set, assets whose
   detected source doesn't match are skipped and counted (`skipped (source filter)`
   in the summary), never silently dropped.
+- **`--skip-sourced`:** skips any asset that ALREADY carries a
+  `source:<platform>` tag from an earlier run. Unlike `process_only` this is a
+  **pre-inference** check reading existing tags, so a skipped asset costs no
+  model time and the decision does not depend on the current model's own source
+  detection. Counted as `skipped (already sourced)`. See
+  *Mixing a local and a remote model* below.
 - **Pacing:** the verify delay is amortised across a group (`BATCH_GROUP_SIZE`)
   rather than paid per asset; re-read is still truth.
 - **Run summary:** total found, processed, sent-to-review, skipped(cache),
@@ -284,6 +311,9 @@ docker compose run --rm immich-ai-classifier python -m app.main --reprocess --ta
 
 # Specific assets:
 docker compose run --rm immich-ai-classifier python -m app.main --reprocess <id1> <id2> --commit
+
+# Re-grade the review queue but leave already-source-tagged content alone:
+docker compose run --rm immich-ai-classifier python -m app.main --reprocess --tag needs-review --commit --skip-sourced
 ```
 
 The four move cases (all remove-from-old except the no-op):
@@ -347,6 +377,66 @@ It is working when the output shows:
 
 Re-run with `--commit` to actually file it.
 
+## Mixing a local and a remote model — `--skip-sourced`
+
+`VISION_ENDPOINT` is endpoint-agnostic, so the same install can run against a
+local server (e.g. Ollama on a LAN GPU) or a remote one (e.g. OpenRouter). They
+are not equally good at the same content:
+
+- **Local small models** are fine on ordinary photographic subjects and cost
+  nothing to run, but are weak at reading on-screen text, watermarks and
+  platform UI — exactly what saved social content depends on. Re-running saved
+  content through one can produce a *worse* classification than a frontier model
+  already recorded (lower confidence, the platform name tagged as the subject).
+- **Remote frontier models** handle that content well but cost money per asset.
+
+`--skip-sourced` lets you split the library between them. Because
+`source_detection` writes a `source:<platform>` tag, that tag marks an asset as
+saved-from-a-platform rather than personal camera-roll:
+
+```bash
+# 1. Local model: personal photos only, saved content untouched.
+docker compose run --rm immich-ai-classifier python -m app.main --batch --commit --skip-sourced
+
+# 2. Then point VISION_* at the remote model and run WITHOUT the flag
+#    to pick up the saved content.
+docker compose run --rm immich-ai-classifier python -m app.main --reprocess --tag needs-review --commit
+```
+
+**Limitation:** this only skips content that already got a `source:` tag from a
+previous run. Anything saved since has never been classified, carries no source
+tag, and will still go through whichever model is configured. Per-asset model
+routing is not implemented.
+
+## Album maintenance — `app.dedupe_albums`
+
+Immich allows several albums to share a **name** (uniqueness is by id), so a
+caller that fails to reuse an album it created earlier in the same run can leave
+hundreds of one-asset duplicates. `execute_plan` now takes a live `album_ids`
+map to prevent this; this tool cleans up existing damage.
+
+```bash
+# Dry-run — writes nothing, prints the plan:
+docker compose run --rm immich-ai-classifier python -m app.dedupe_albums
+
+# Act:
+docker compose run --rm immich-ai-classifier python -m app.dedupe_albums --commit
+
+# Scope to one album name:
+docker compose run --rm immich-ai-classifier python -m app.dedupe_albums --commit --name Pets
+```
+
+- Groups albums by name; the **canonical** is the one holding the most assets,
+  ties broken by the earliest `createdAt`.
+- Moves each duplicate's assets into the canonical, then deletes the emptied
+  duplicate. `--commit` defaults OFF.
+- **Re-read is truth:** an album is never deleted until every one of its assets
+  is confirmed present in the canonical. Unverified means the album is **KEPT**.
+- **NO ASSET DELETION** — album containers only. Deleting an Immich album never
+  deletes its photos; they stay in the library and in any other album they
+  belong to. `ImmichClient.delete_album` is the only destructive call in the
+  client.
+
 ## Notes
 
 - The container runs as root so it can read library files regardless of the
@@ -361,4 +451,3 @@ Re-run with `--commit` to actually file it.
   Immich, which is why `IMMICH_INTERNAL_PREFIX=/usr/src/app/upload`.
 - The `TEXT_*` inference role is a placeholder, captured but unused (the
   classifier is vision-only; Whisper/transcript is out of scope).
-```
