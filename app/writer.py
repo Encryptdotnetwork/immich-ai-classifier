@@ -212,9 +212,12 @@ def format_plan(plan: Plan, commit: bool) -> str:
     return "\n".join(lines)
 
 
-def _current_tag_ids(client: ImmichClient, asset_id: str) -> set[str]:
+def _current_state(client: ImmichClient, asset_id: str) -> tuple[set[str], Any]:
+    """One re-read returning (tag_ids, description) — the two mutually-clobbering
+    fields, so the repair loop checks both from a single consistent snapshot."""
     asset = client.get_asset(asset_id)
-    return {t.get("id") for t in asset.get("tags", []) if isinstance(t, dict)}
+    tags = {t.get("id") for t in asset.get("tags", []) if isinstance(t, dict)}
+    return tags, (asset.get("exifInfo") or {}).get("description")
 
 
 def _asset_in_album(client: ImmichClient, asset_id: str, album_id: str) -> bool:
@@ -261,10 +264,13 @@ def execute_plan(plan: Plan, cfg: Config, client: ImmichClient) -> Outcome:
         album_id = client.create_album(plan.album_name)["id"]
     client.add_assets_to_album(album_id, [asset_id])
 
-    # 3. Description — BEFORE tagging, never interleaved with tag writes.
+    # 3. Description and tags CLOBBER EACH OTHER. A description write
+    #    (PUT /api/assets/{id}) can wipe tags, and a tag write can blank the
+    #    description — whichever lands last wins, which is why a fixed ordering
+    #    flip-flops between runs. So we issue both, then run ONE repair loop that
+    #    re-reads and rewrites whichever field came back wrong, until both hold
+    #    together in a single snapshot. Re-read is still the only success signal.
     client.update_asset(asset_id, description=plan.description)
-
-    # 4. Tag in ONE bulk call, then verify-and-retry against re-reads.
     if intended_ids:
         client.bulk_tag_assets(intended_ids, [asset_id])
 
@@ -274,20 +280,25 @@ def execute_plan(plan: Plan, cfg: Config, client: ImmichClient) -> Outcome:
     for _ in range(cfg.tag_verify_max_retries):
         time.sleep(cfg.tag_verify_delay)
         verify_passes += 1
-        current = _current_tag_ids(client, asset_id)
+        current, desc_now = _current_state(client, asset_id)
         missing_ids = [tid for tid in intended_ids if tid not in current]
-        if not missing_ids:
+        desc_ok = desc_now == plan.description
+        if not missing_ids and desc_ok:
             break
-        client.bulk_tag_assets(missing_ids, [asset_id])  # re-tag only the misses
-        retags += 1
+        # Repair only what is actually wrong; re-writing the good field would
+        # just clobber the other one again.
+        if missing_ids:
+            client.bulk_tag_assets(missing_ids, [asset_id])
+            retags += 1
+        if not desc_ok:
+            client.update_asset(asset_id, description=plan.description)
     else:
-        # Loop exhausted without a clean read — do one final authoritative verify
-        # so we never report based on an un-verified re-tag.
-        if intended_ids:
-            time.sleep(cfg.tag_verify_delay)
-            verify_passes += 1
-            current = _current_tag_ids(client, asset_id)
-            missing_ids = [tid for tid in intended_ids if tid not in current]
+        # Loop exhausted — one final authoritative verify so we never report on
+        # the back of an un-verified repair write.
+        time.sleep(cfg.tag_verify_delay)
+        verify_passes += 1
+        current, _ = _current_state(client, asset_id)
+        missing_ids = [tid for tid in intended_ids if tid not in current]
 
     # 5. Final re-reads for the report (asset + album membership).
     final_asset = client.get_asset(asset_id)
@@ -410,14 +421,20 @@ def execute_plans_batch(
         verify_passes += 1
         all_clean = True
         for s in states:
-            if not s["intended"]:
-                continue
-            current = _current_tag_ids(client, s["plan"].asset_id)
+            plan = s["plan"]
+            current, desc_now = _current_state(client, plan.asset_id)
             missing = [tid for tid in s["intended"] if tid not in current]
+            desc_ok = desc_now == plan.description
+            if not missing and desc_ok:
+                continue
+            all_clean = False
+            # Tags and description clobber each other (see execute_plan) —
+            # repair only the field that actually came back wrong.
             if missing:
-                all_clean = False
-                client.bulk_tag_assets(missing, [s["plan"].asset_id])
+                client.bulk_tag_assets(missing, [plan.asset_id])
                 s["retags"] += 1
+            if not desc_ok:
+                client.update_asset(plan.asset_id, description=plan.description)
         if all_clean:
             break
     else:
