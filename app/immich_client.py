@@ -148,6 +148,16 @@ class ImmichClient:
             "DELETE", f"albums/{album_id}/assets", json={"ids": asset_ids}
         )
 
+    def delete_album(self, album_id: str) -> Any:
+        """DELETE /api/albums/{id} — delete an ALBUM CONTAINER only.
+
+        Immich does NOT delete the album's assets: they stay in the library and
+        in any other album they belong to. Used by app/dedupe_albums.py to clear
+        up duplicate same-named albums. Still the only destructive call in this
+        client — callers must confirm intent before using it.
+        """
+        return self._request("DELETE", f"albums/{album_id}")
+
     def untag_assets(self, tag_id: str, asset_ids: list[str]) -> Any:
         """DELETE /api/tags/{id}/assets — remove ONE tag from many assets (inverse of tagAssets)."""
         return self._request(
