@@ -198,7 +198,9 @@ def run_reprocess(
             # _Review, still tagged) and must NOT be cached — otherwise it is
             # stranded: pulled from the queue but filed nowhere, and invisible to
             # a needs-review-scoped rerun. ---
-            add_outcome = execute_plan(plan, cfg, client)
+            # album_id_by_name is live: execute_plan records any album it creates
+            # so the next asset of the same category reuses it (see writer step 2).
+            add_outcome = execute_plan(plan, cfg, client, album_ids=album_id_by_name)
             summary["verify_retries"] += add_outcome.retags
 
             if not add_outcome.ok:

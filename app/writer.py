@@ -234,7 +234,10 @@ def _asset_in_album(client: ImmichClient, asset_id: str, album_id: str) -> bool:
     return any(a.get("id") == album_id for a in albums)
 
 
-def execute_plan(plan: Plan, cfg: Config, client: ImmichClient) -> Outcome:
+def execute_plan(
+    plan: Plan, cfg: Config, client: ImmichClient,
+    album_ids: Optional[dict[str, str]] = None,
+) -> Outcome:
     """Commit the plan, then verify by RE-READING. Tag writes happen LAST.
 
     Order: create missing tag defs -> add to album -> write description ->
@@ -259,9 +262,19 @@ def execute_plan(plan: Plan, cfg: Config, client: ImmichClient) -> Outcome:
             unresolved.append(tp.normalized)
 
     # 2. Album: create-or-reuse, then add the asset.
+    #    plan.album_id comes from a list the CALLER prefetched once, so an album
+    #    created during this run is absent from it and every later asset in the
+    #    same category would create ANOTHER album of the same name (Immich allows
+    #    duplicate album names). Callers processing many assets pass a live
+    #    album_ids map which we read AND write, so a name is only ever created
+    #    once per run.
     album_id = plan.album_id
+    if not album_id and album_ids is not None:
+        album_id = album_ids.get(plan.album_name)
     if not album_id:
         album_id = client.create_album(plan.album_name)["id"]
+        if album_ids is not None:
+            album_ids[plan.album_name] = album_id
     client.add_assets_to_album(album_id, [asset_id])
 
     # 3. Description and tags CLOBBER EACH OTHER. A description write
