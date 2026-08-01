@@ -182,11 +182,25 @@ def run_reprocess(
                     moves[move_key] = moves.get(move_key, 0) + 1
                 continue
 
-            # --- COMMIT: add new (Stage 3 verify), then remove old (verify) ---
+            # --- COMMIT: add new (Stage 3 verify) FIRST. Only after the add is
+            # verified do we remove from the old album / strip needs-review. A
+            # failed add must leave the asset exactly where it was (still in
+            # _Review, still tagged) and must NOT be cached — otherwise it is
+            # stranded: pulled from the queue but filed nowhere, and invisible to
+            # a needs-review-scoped rerun. ---
             add_outcome = execute_plan(plan, cfg, client)
             summary["verify_retries"] += add_outcome.retags
-            ok = add_outcome.ok
 
+            if not add_outcome.ok:
+                # Add did not persist. Touch nothing else — no album removal, no
+                # tag strip, no cache write — so the asset stays recoverable.
+                summary["failed"].append(asset_id)
+                print(f"  [FAIL] {asset_id}  {move_key}  add_ok=False "
+                      f"(left in place; nothing removed, not cached)  "
+                      f"missing={add_outcome.missing_tag_names}")
+                continue
+
+            ok = True
             removed: list[tuple[str, bool]] = []
             for old in albums_to_remove:
                 old_id = album_id_by_name.get(old) or _resolve_album_id(client, old)
@@ -226,9 +240,12 @@ def run_reprocess(
                 print(f"  [OK ] {asset_id}  {move_key}  "
                       f"({add_outcome.present_count}/{add_outcome.intended_count} tags{tail})")
             else:
+                # Add succeeded (asset is safely in new_album, cached as such); a
+                # removal or the tag strip did not fully verify, so it may linger
+                # in the old album. Not stranded — recoverable on a plain rerun.
                 summary["failed"].append(asset_id)
                 stuck = [a for a, o in removed if not o]
-                print(f"  [FAIL] {asset_id}  {move_key}  add_ok={add_outcome.ok} "
+                print(f"  [FAIL] {asset_id}  {move_key}  add_ok=True "
                       f"stuck_albums={stuck} review_tag_removed={review_tag_removed}")
 
         except (VisionError, SignalError) as exc:
