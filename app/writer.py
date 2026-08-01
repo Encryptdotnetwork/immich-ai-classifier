@@ -217,6 +217,20 @@ def _current_tag_ids(client: ImmichClient, asset_id: str) -> set[str]:
     return {t.get("id") for t in asset.get("tags", []) if isinstance(t, dict)}
 
 
+def _asset_in_album(client: ImmichClient, asset_id: str, album_id: str) -> bool:
+    """Confirm album membership from the ASSET side, never the album side.
+
+    GET /api/albums/{id} silently caps at ~1000 assets (the same cap that forces
+    enumeration through search/metadata). Re-reading a large album — _Review at
+    1,900+, General at 1,500+ — therefore cannot SEE a member past the cap and
+    returns a false negative, failing writes that actually landed. The
+    asset-scoped GET /api/albums?assetId=... is uncapped and is the only safe
+    membership verification for albums of any size.
+    """
+    albums = client.get_albums_for_asset(asset_id) or []
+    return any(a.get("id") == album_id for a in albums)
+
+
 def execute_plan(plan: Plan, cfg: Config, client: ImmichClient) -> Outcome:
     """Commit the plan, then verify by RE-READING. Tag writes happen LAST.
 
@@ -279,8 +293,7 @@ def execute_plan(plan: Plan, cfg: Config, client: ImmichClient) -> Outcome:
     final_asset = client.get_asset(asset_id)
     final_tag_ids = {t.get("id") for t in final_asset.get("tags", []) if isinstance(t, dict)}
     final_desc = (final_asset.get("exifInfo") or {}).get("description")
-    album = client.get_album(album_id)
-    member = asset_id in {a.get("id") for a in album.get("assets", [])}
+    member = _asset_in_album(client, asset_id, album_id)
 
     present = sum(1 for tid in intended_ids if tid in final_tag_ids)
     missing_now = [tid for tid in intended_ids if tid not in final_tag_ids]
@@ -345,8 +358,7 @@ def _finalize(
     final = client.get_asset(plan.asset_id)
     final_ids = {t.get("id") for t in final.get("tags", []) if isinstance(t, dict)}
     desc = (final.get("exifInfo") or {}).get("description")
-    album = client.get_album(album_id)
-    member = plan.asset_id in {a.get("id") for a in album.get("assets", [])}
+    member = _asset_in_album(client, plan.asset_id, album_id)
     present = sum(1 for tid in intended if tid in final_ids)
     missing = [tid for tid in intended if tid not in final_ids]
     return Outcome(
@@ -428,19 +440,20 @@ def execute_plans_batch(
 # truth, never the HTTP status. Each returns (ok, retries).
 # --------------------------------------------------------------------------
 
-def _album_member_ids(client: ImmichClient, album_id: str) -> set[str]:
-    return {a.get("id") for a in client.get_album(album_id).get("assets", [])}
-
-
 def remove_from_album_verified(
     album_id: str, asset_id: str, cfg: Config, client: ImmichClient
 ) -> tuple[bool, int]:
-    """Remove an asset from an album; confirm by RE-READING the album. Retries."""
+    """Remove an asset from an album; confirm by RE-READING. Retries.
+
+    Verification is asset-scoped (_asset_in_album) — reading the album back
+    would hit the ~1000 cap and report a removal as successful simply because
+    the asset sits beyond the cap.
+    """
     retries = 0
     for attempt in range(cfg.tag_verify_max_retries + 1):
         client.remove_assets_from_album(album_id, [asset_id])
         time.sleep(cfg.tag_verify_delay)
-        if asset_id not in _album_member_ids(client, album_id):
+        if not _asset_in_album(client, asset_id, album_id):
             return True, retries
         retries += 1
     return False, retries
