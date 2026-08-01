@@ -117,6 +117,30 @@ def _enumerate(
 
 # --- per-asset decisions --------------------------------------------------
 
+def has_source_tag(asset: dict[str, Any], client: ImmichClient) -> bool:
+    """True if the asset already carries a `source:<platform>` tag.
+
+    Used by --skip-sourced to leave saved social content alone. Source tags are
+    only ever written by a prior classification run, so their presence marks an
+    asset as saved-from-a-platform rather than personal camera-roll. This is a
+    PRE-INFERENCE check — it reads existing tags rather than asking the model,
+    so a skipped asset costs no GPU time (and does not depend on the local
+    model's own weak source detection).
+
+    NOTE: search/metadata items omit tags on 2.7.5, so fall back to a full
+    get_asset when the passed-in dict carries none.
+    """
+    tags = asset.get("tags")
+    if not tags:
+        tags = (client.get_asset(asset["id"]) or {}).get("tags") or []
+    for t in tags:
+        if isinstance(t, dict):
+            name = t.get("value") or t.get("name") or ""
+            if str(name).strip().lower().startswith("source:"):
+                return True
+    return False
+
+
 def _has_marker(asset: dict[str, Any]) -> bool:
     marker = load_taxonomy().marker_tag
     for t in asset.get("tags") or []:
@@ -201,7 +225,10 @@ def _snapshot(asset: dict[str, Any]) -> dict[str, Any]:
 
 # --- main batch run -------------------------------------------------------
 
-def run_batch(cfg: Config, client: ImmichClient, *, commit: bool, limit: Optional[int]) -> int:
+def run_batch(
+    cfg: Config, client: ImmichClient, *, commit: bool, limit: Optional[int],
+    skip_sourced: bool = False,
+) -> int:
     if not cfg.vision.configured:
         print(
             "[config] Batch needs VISION_ENDPOINT and VISION_MODEL set. See .env.example.",
@@ -236,8 +263,8 @@ def run_batch(cfg: Config, client: ImmichClient, *, commit: bool, limit: Optiona
 
     summary = {
         "found": total_found, "processed": 0, "skipped_cache": 0,
-        "skipped_human": 0, "skipped_source": 0, "review": 0, "failed": [],
-        "verify_retries": 0,
+        "skipped_human": 0, "skipped_source": 0, "skipped_sourced": 0,
+        "review": 0, "failed": [], "verify_retries": 0,
     }
     dry_probe: Optional[tuple[str, dict[str, Any]]] = None
     pending: list[_Item] = []
@@ -282,6 +309,13 @@ def run_batch(cfg: Config, client: ImmichClient, *, commit: bool, limit: Optiona
             if action == "skip_human":
                 summary["skipped_human"] += 1
                 print(f"  [skip] {asset_id}  human-touched — left untouched")
+                continue
+
+            # Pre-inference: leave already-source-tagged (saved social) content
+            # for a remote-model pass. Costs no GPU time.
+            if skip_sourced and has_source_tag(asset, client):
+                summary["skipped_sourced"] += 1
+                print(f"  [skip] {asset_id}  already source-tagged — left for a remote-model pass")
                 continue
 
             result = classify_asset(asset, cfg, vision, client)
@@ -350,6 +384,8 @@ def run_batch(cfg: Config, client: ImmichClient, *, commit: bool, limit: Optiona
     print(f"  skipped (cache)        : {summary['skipped_cache']}")
     print(f"  skipped (human-touched): {summary['skipped_human']}")
     print(f"  skipped (source filter): {summary['skipped_source']}")
+    if skip_sourced:
+        print(f"  skipped (already sourced): {summary['skipped_sourced']}")
     print(f"  failed                 : {len(summary['failed'])}  {summary['failed']}")
     print(f"  total verify-retries   : {summary['verify_retries']}")
     print("-" * 72)

@@ -25,6 +25,7 @@ from .batch import (
     _filed_albums,
     _resolve_album_id,
     _snapshot,
+    has_source_tag,
     human_edit_reason,
     route,
     search_paginated,
@@ -77,7 +78,7 @@ def _resolve_scope(
 def run_reprocess(
     cfg: Config, client: ImmichClient, *, commit: bool, limit: Optional[int],
     album: Optional[str], tag: Optional[str], asset_ids: list[str],
-    include_human_edited: bool,
+    include_human_edited: bool, skip_sourced: bool = False,
 ) -> int:
     if not cfg.vision.configured:
         print("[config] Reprocess needs VISION_ENDPOINT and VISION_MODEL set.", file=sys.stderr)
@@ -119,7 +120,8 @@ def run_reprocess(
 
     summary = {
         "scope": total, "reprocessed": 0, "unchanged": 0, "skipped_human": 0,
-        "skipped_source": 0, "human_overridden": 0, "failed": [], "verify_retries": 0,
+        "skipped_source": 0, "skipped_sourced": 0, "human_overridden": 0,
+        "failed": [], "verify_retries": 0,
     }
     moves: dict[str, int] = {}
     dry_probe: Optional[tuple[str, dict[str, Any]]] = None
@@ -135,6 +137,14 @@ def run_reprocess(
                     continue
                 summary["human_overridden"] += 1
                 print(f"  [WARN] overriding human-edited ({reason}): {asset_id}")
+
+            # Pre-inference: leave already-source-tagged (saved social) content
+            # alone so a local model does not degrade a remote model's earlier,
+            # better classification. Costs no GPU time.
+            if skip_sourced and has_source_tag(asset, client):
+                summary["skipped_sourced"] += 1
+                print(f"  [skip] {asset_id}  already source-tagged — left for a remote-model pass")
+                continue
 
             # Cache override: always classify within scope.
             result = classify_asset(asset, cfg, vision, client)
@@ -274,6 +284,8 @@ def run_reprocess(
     print(f"  unchanged (no move)    : {summary['unchanged']}")
     print(f"  skipped (human-touched): {summary['skipped_human']}")
     print(f"  skipped (source filter): {summary['skipped_source']}")
+    if skip_sourced:
+        print(f"  skipped (already sourced): {summary['skipped_sourced']}")
     if include_human_edited:
         print(f"  human-edited OVERRIDDEN : {summary['human_overridden']}")
     print(f"  failed                 : {len(summary['failed'])}  {summary['failed']}")

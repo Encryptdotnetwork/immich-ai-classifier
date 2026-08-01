@@ -278,11 +278,15 @@ def run(argv: list[str]) -> int:
         return run_reprocess(
             cfg, client, commit=commit, limit=limit, album=album, tag=tag,
             asset_ids=positionals, include_human_edited="--include-human-edited" in flags,
+            skip_sourced="--skip-sourced" in flags,
         )
 
     # Batch mode sources assets from the album; no asset id needed.
     if "--batch" in flags:
-        return run_batch(cfg, client, commit=commit, limit=limit)
+        return run_batch(
+            cfg, client, commit=commit, limit=limit,
+            skip_sourced="--skip-sourced" in flags,
+        )
 
     asset_id = _resolve_asset_id(positionals)
     # --commit implies the classify+file flow (you can't file without classifying).
