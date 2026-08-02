@@ -227,6 +227,13 @@ Writer behaviour:
   **FAIL** with the missing tags — it never silently passes.
 - Non-zero `verify-retries` in a run summary is normal and means the repair loop
   did its job; it is not an error count.
+- **Pre-existing tags are preserved.** The repair loop re-adds the ids it was
+  asked to verify, so the asset's CURRENT tags are read first and unioned into
+  that set. Without this, a clobber followed by a repair would restore only the
+  current run's tags and permanently drop anything else — e.g. a
+  `source:<platform>` tag written by an earlier, better model that the current
+  model did not re-emit. Deliberate removals are unaffected: `--reprocess`
+  strips `needs-review` after the write completes.
 - **Album membership is verified from the ASSET side**
   (`GET /api/albums?assetId=`), never by re-reading the album and scanning its
   asset list. The album-side read is capped and would false-negative a write

@@ -261,6 +261,18 @@ def execute_plan(
         elif not tid:
             unresolved.append(tp.normalized)
 
+    # PRESERVE tags already on the asset. A clobbered write is repaired by
+    # re-adding only the ids we ask for, so any pre-existing tag left out here
+    # is lost PERMANENTLY — e.g. a source:<platform> tag written by an earlier,
+    # better model that the current model did not re-emit. Union them into the
+    # set we verify so a repair restores the asset's full tag state, not just
+    # this run's contribution. (Deliberate removals still work: reprocess
+    # strips needs-review AFTER execute_plan returns.)
+    preexisting_ids, _ = _current_state(client, asset_id)
+    for tid in preexisting_ids:
+        if tid and tid not in intended_ids:
+            intended_ids.append(tid)
+
     # 2. Album: create-or-reuse, then add the asset.
     #    plan.album_id comes from a list the CALLER prefetched once, so an album
     #    created during this run is absent from it and every later asset in the
@@ -420,8 +432,14 @@ def execute_plans_batch(
             album_id = client.create_album(plan.album_name)["id"]
             album_ids[plan.album_name] = album_id
         client.add_assets_to_album(album_id, [plan.asset_id])
-        client.update_asset(plan.asset_id, description=plan.description)
         intended, unresolved = _resolve_plan_tags(plan, by_key)
+        # Preserve tags already on the asset — see execute_plan. Read BEFORE the
+        # description write, which is what can clobber them.
+        preexisting_ids, _ = _current_state(client, plan.asset_id)
+        for tid in preexisting_ids:
+            if tid and tid not in intended:
+                intended.append(tid)
+        client.update_asset(plan.asset_id, description=plan.description)
         if intended:
             client.bulk_tag_assets(intended, [plan.asset_id])
         states.append({"plan": plan, "album_id": album_id, "intended": intended,
