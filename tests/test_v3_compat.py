@@ -59,6 +59,52 @@ def test_visibility_is_sent_on_every_page_not_just_the_first():
     assert all(b["visibility"] == "timeline" for b in c.bodies)
 
 
+class _Paged:
+    """Serves `total` assets in pages, reporting Immich's per-page 'total'."""
+
+    def __init__(self, total, page_size=500):
+        self.total, self.page_size, self.calls = total, page_size, 0
+
+    def search_metadata(self, body):
+        self.calls += 1
+        page, size = body["page"], body["size"]
+        start = (page - 1) * size
+        items = [{"id": f"a{i}"} for i in range(start, min(start + size, self.total))]
+        more = start + size < self.total
+        return {"assets": {
+            "total": len(items),           # per-page, which was the whole bug
+            "items": items,
+            "nextPage": str(page + 1) if more else None,
+        }}
+
+
+def test_scope_size_is_the_real_count_not_the_page_size():
+    """Reported 500 for a 1,300-asset scope, so a --limit run couldn't size the job."""
+    c = _Paged(total=1300)
+    assets, total = search_paginated(c, {"albumIds": ["a"]}, limit=20)
+    assert len(assets) == 20
+    assert total == 1300          # not 500, and not 20
+    assert c.calls == 3           # walked to the end, cheaply
+
+
+def test_counting_pages_costs_no_extra_calls_when_unlimited():
+    c = _Paged(total=1300)
+    assets, total = search_paginated(c, {"albumIds": ["a"]}, limit=None)
+    assert (len(assets), total, c.calls) == (1300, 1300, 3)
+
+
+def test_count_total_false_stops_at_the_limit():
+    c = _Paged(total=1300)
+    assets, total = search_paginated(c, {"albumIds": ["a"]}, limit=20, count_total=False)
+    assert len(assets) == 20
+    assert c.calls == 1           # no extra paging
+
+
+def test_single_page_scope_is_exact():
+    c = _Paged(total=114)
+    assert search_paginated(c, {"albumIds": ["a"]}, limit=None)[1] == 114
+
+
 def test_explicit_visibility_argument_overrides_the_default():
     c = _RecordingClient()
     search_paginated(c, {"albumIds": ["alb1"]}, None, visibility="archive")

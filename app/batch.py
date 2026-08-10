@@ -87,12 +87,15 @@ def _resolve_album_id(client: ImmichClient, name: str) -> Optional[str]:
 def search_paginated(
     client: ImmichClient, body_filter: dict[str, Any], limit: Optional[int],
     page_size: int = _PAGE_SIZE, visibility: Optional[str] = DEFAULT_SEARCH_VISIBILITY,
+    count_total: bool = True,
 ) -> tuple[list[dict[str, Any]], int]:
     """Paginate POST /api/search/metadata with the given filter (albumIds /
     tagIds / ...). Returns (assets, total).
 
-    'total' is the real match count reported by search (NOT the ~1000-capped
-    GET /api/albums/{id}); we stop early once we have 'limit' assets.
+    'total' is counted by walking the pages, because Immich's ``assets.total``
+    is per-page, not the match count. With ``count_total`` (the default) a
+    --limit run still pages to the end to establish the true scope size; those
+    extra calls are search only, no inference. Pass False to stop at the limit.
 
     ``visibility`` is ALWAYS sent explicitly. Immich 2.x defaulted to 'timeline'
     when it was omitted; Immich 3.0 changed that default to ANY visibility, so
@@ -102,26 +105,40 @@ def search_paginated(
     present in body_filter always wins.
     """
     collected: list[dict[str, Any]] = []
-    total: Optional[int] = None
+    seen = 0
     page = 1
+    truncated_at: Optional[int] = None
+
     while True:
         body = {**body_filter, "page": page, "size": page_size, "withExif": True}
         if visibility is not None and "visibility" not in body_filter:
             body["visibility"] = visibility
         resp = client.search_metadata(body) or {}
         block = resp.get("assets") or {}
-        if total is None:
-            total = block.get("total")
         items = block.get("items") or []
-        collected.extend(items)
-        if limit and len(collected) >= limit:
-            collected = collected[:limit]
-            break
+
+        # Immich's assets.total is the count IN THIS PAGE, not the match count.
+        # Reading it once off page 1 reported "500" for any album bigger than a
+        # page, which made a --limit run unable to tell you how big the job
+        # actually is. Count what we actually walk instead.
+        seen += len(items)
+        if truncated_at is None:
+            collected.extend(items)
+            if limit and len(collected) >= limit:
+                collected = collected[:limit]
+                truncated_at = page
+
         next_page = block.get("nextPage")
         if not items or not next_page:
             break
         page = int(next_page)
-    return collected, (total if total is not None else len(collected))
+        # Past the limit we keep paging purely to finish counting. No inference
+        # happens here, so it costs a couple of cheap search calls and buys an
+        # honest scope size to plan a long run against.
+        if truncated_at is not None and not count_total:
+            break
+
+    return collected, (seen if (count_total or truncated_at is None) else len(collected))
 
 
 def _enumerate(
