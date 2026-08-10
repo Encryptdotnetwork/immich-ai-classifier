@@ -88,7 +88,43 @@ def test_parse_summary_degrades_to_transcript_excerpt():
     """A garbled reply must not lose the transcript we already paid to produce."""
     s = parse_summary("the model rambled instead of returning json", fallback_text="a" * 900)
     assert s.ok is False
-    assert s.summary == "a" * 300
+    assert len(s.summary) <= 300
+
+
+def test_overlong_summary_is_clipped_at_a_sentence_boundary():
+    """Observed live: the model returned ~1000 chars of markdown bullets."""
+    from app.summarise import _clip
+
+    long = ("The trader explains position sizing using the one percent risk rule. "
+            "Determine account size first. " + ("Then do a lot more things. " * 20))
+    out = _clip(long)
+    assert len(out) <= 300
+    assert out.endswith(".")          # cut at a sentence, not mid-word
+    assert not out.endswith(" .")
+
+
+def test_clip_collapses_markdown_newlines_to_one_line():
+    """Immich descriptions are a single field; bullet lists render as noise."""
+    from app.summarise import _clip
+
+    out = _clip("Line one.\n\n1. **Bold item**\n2. Another item")
+    assert "\n" not in out
+    assert out == "Line one. 1. **Bold item** 2. Another item"
+
+
+def test_clip_falls_back_to_word_boundary_when_no_sentence_end():
+    from app.summarise import _clip
+
+    out = _clip("word " * 200)
+    assert len(out) <= 300
+    assert out.endswith("…")
+    assert not out.endswith("wor…")   # never mid-word
+
+
+def test_short_summary_is_untouched():
+    from app.summarise import _clip
+
+    assert _clip("A short summary.") == "A short summary."
 
 
 def test_parse_summary_strips_qwen3_thinking_block():
@@ -119,6 +155,135 @@ def test_truncated_thinking_block_falls_back_instead_of_parsing_garbage():
     s = parse_summary(raw, fallback_text="the raw transcript text")
     assert s.ok is False
     assert s.summary == "the raw transcript text"
+
+
+def _client_returning(message: dict):
+    """A TextClient whose HTTP layer is stubbed to return one message object."""
+    import app.summarise as summarise
+
+    class _Resp:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"choices": [{"message": message}]}
+
+    class _Session:
+        headers = {}
+
+        def post(self, *a, **k):
+            return _Resp()
+
+    c = summarise.TextClient.__new__(summarise.TextClient)
+    c._url = "http://stub/v1/chat/completions"
+    c._model = "qwen3:30b-a3b"
+    c._timeout = 5
+    c._max_tokens = 2000
+    c._no_think = False
+    c._structured = False
+    c._session = _Session()
+    return c
+
+
+def test_empty_content_with_reasoning_raises_a_useful_error():
+    """The real failure: Ollama put the thinking elsewhere and content was ''."""
+    from app.summarise import SummariseError
+
+    c = _client_returning({"content": "", "reasoning_content": "Let me consider..."})
+    try:
+        c.complete("sys", "user")
+    except SummariseError as exc:
+        msg = str(exc)
+        assert "thinking" in msg
+        assert "TEXT_NO_THINK" in msg  # tells the user what to actually do
+        assert "Let me consider" in msg
+    else:
+        raise AssertionError("expected SummariseError")
+
+
+def test_empty_content_without_reasoning_still_raises():
+    from app.summarise import SummariseError
+
+    c = _client_returning({"content": ""})
+    try:
+        c.complete("sys", "user")
+    except SummariseError as exc:
+        assert "empty reply" in str(exc)
+    else:
+        raise AssertionError("expected SummariseError")
+
+
+def test_normal_content_is_returned_unchanged():
+    c = _client_returning({"content": '{"summary": "fine"}'})
+    assert c.complete("sys", "user") == '{"summary": "fine"}'
+
+
+def test_schema_is_sent_when_structured():
+    import app.summarise as summarise
+
+    sent = {}
+
+    class _Resp:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"summary":"x"}'}}]}
+
+    class _Session:
+        headers = {}
+
+        def post(self, url, json=None, timeout=None):
+            sent.update(json or {})
+            return _Resp()
+
+    c = summarise.TextClient.__new__(summarise.TextClient)
+    c._url, c._model, c._timeout = "http://stub", "m", 5
+    c._max_tokens, c._no_think, c._structured = 2000, False, True
+    c._session = _Session()
+    c.complete("sys", "user")
+
+    rf = sent["response_format"]
+    assert rf["type"] == "json_schema"
+    assert rf["json_schema"]["schema"] == summarise.SUMMARY_JSON_SCHEMA
+    assert "summary" in rf["json_schema"]["schema"]["required"]
+
+
+def test_http_400_on_schema_falls_back_and_retries_once():
+    """A provider without schema support must degrade, not fail every asset."""
+    import app.summarise as summarise
+
+    calls = []
+
+    class _Resp400:
+        status_code = 400
+        text = "unknown field response_format"
+
+        def json(self):
+            return {}
+
+    class _Resp200:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"summary":"recovered"}'}}]}
+
+    class _Session:
+        headers = {}
+
+        def post(self, url, json=None, timeout=None):
+            calls.append("response_format" in (json or {}))
+            return _Resp400() if len(calls) == 1 else _Resp200()
+
+    c = summarise.TextClient.__new__(summarise.TextClient)
+    c._url, c._model, c._timeout = "http://stub", "m", 5
+    c._max_tokens, c._no_think, c._structured = 2000, False, True
+    c._session = _Session()
+
+    assert c.complete("sys", "user") == '{"summary":"recovered"}'
+    assert calls == [True, False]      # first with schema, retry without
+    assert c._structured is False      # and stays off for the rest of the run
 
 
 def test_parse_summary_caps_topics_at_eight():

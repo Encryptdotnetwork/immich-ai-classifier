@@ -164,6 +164,10 @@ class Config:
     text_max_tokens: int = 2000
     # Append '/no_think' to disable the reasoning block on Qwen3-class models.
     text_no_think: bool = False
+    # Constrain generation to the summary JSON schema. Ollama compiles this to a
+    # grammar, making non-JSON output impossible. Auto-disables if the endpoint
+    # returns HTTP 400 for it.
+    text_structured: bool = True
 
     # --- Speech-to-text (see app/transcribe.py) ---
     # Defaults to a disabled WhisperConfig so existing callers and tests that
@@ -204,6 +208,7 @@ class Config:
             search_visibility=_optional("SEARCH_VISIBILITY", "timeline"),
             text_max_tokens=_optional_int("TEXT_MAX_TOKENS", 2000),
             text_no_think=_optional_bool("TEXT_NO_THINK", False),
+            text_structured=_optional_bool("TEXT_STRUCTURED", True),
             whisper=WhisperConfig(
                 enabled=_optional_bool("WHISPER_ENABLED", False),
                 model=_optional("WHISPER_MODEL", "base"),

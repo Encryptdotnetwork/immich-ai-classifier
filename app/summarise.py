@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -33,6 +34,30 @@ TEXT_TIMEOUT = 120  # seconds
 # and never emit the JSON at all, which looks identical to "the model failed".
 # 2000 leaves room for the reasoning plus the ~200-token answer.
 DEFAULT_MAX_TOKENS = 2000
+# Description-field budget. Chosen from the spike's measured distribution: raw
+# transcripts run 1,000-3,800 chars, which is unusable in Immich's UI, so the
+# summary is what actually lands on the asset.
+SUMMARY_MAX_CHARS = 300
+
+# Constrained generation. Ollama (and llama.cpp under it) compiles this into a
+# GBNF grammar, so every token the model emits MUST fit the schema. That makes
+# markdown fences, prose preambles and reasoning blocks structurally impossible
+# rather than merely discouraged — which is the difference between asking for
+# JSON and getting it. Also much faster, since the model cannot wander.
+SUMMARY_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        # maxLength is enforced by llama.cpp's grammar where supported and
+        # ignored elsewhere, so the prompt still carries the length rule and
+        # _clip() below is the real backstop.
+        "summary": {"type": "string", "maxLength": SUMMARY_MAX_CHARS},
+        "topics": {"type": "array", "items": {"type": "string"}},
+        "spoken_language": {"type": "string"},
+        "has_useful_content": {"type": "boolean"},
+    },
+    "required": ["summary", "topics", "has_useful_content"],
+    "additionalProperties": False,
+}
 # Whisper output for a long clip can exceed a small local model's context. Trim
 # from the middle rather than the tail: the opening states the topic and the
 # close usually carries the takeaway, so both ends matter more than the middle.
@@ -109,6 +134,27 @@ class Summary:
         return out
 
 
+def _clip(text: str, limit: int = SUMMARY_MAX_CHARS) -> str:
+    """Clip a summary to the description budget WITHOUT cutting mid-word.
+
+    Models ignore a stated character limit often enough that this has to be
+    enforced here. A hard slice leaves things like '...Calculate 1% of total
+    tradi', so we back off to the last sentence end, and failing that the last
+    word boundary, and mark the elision.
+    """
+    text = " ".join(text.split())  # collapse newlines/bullets to one line
+    if len(text) <= limit:
+        return text
+
+    window = text[: limit - 1]
+    for end in (". ", "! ", "? "):
+        cut = window.rfind(end)
+        if cut >= limit * 0.6:  # only if it leaves a substantial summary
+            return window[: cut + 1]
+    cut = window.rfind(" ")
+    return (window[:cut] if cut > 0 else window).rstrip(",;:") + "…"
+
+
 def _trim(text: str, limit: int = MAX_TRANSCRIPT_CHARS) -> str:
     """Keep both ends of an over-long transcript, marking the elision."""
     if len(text) <= limit:
@@ -123,8 +169,13 @@ class TextClient:
     def __init__(
         self, role: InferenceRole, timeout: int = TEXT_TIMEOUT,
         max_tokens: int = DEFAULT_MAX_TOKENS, no_think: bool = False,
+        structured: bool = True,
     ) -> None:
         self._max_tokens = max_tokens
+        # Whether to constrain generation to SUMMARY_JSON_SCHEMA. Flipped off
+        # automatically and permanently if the endpoint rejects it, so a
+        # provider without schema support degrades instead of failing the run.
+        self._structured = structured
         # Qwen3 and friends read '/no_think' as an instruction to skip the
         # reasoning block. Summarising a transcript into two sentences does not
         # need chain-of-thought, and skipping it roughly thirds the tokens spent
@@ -153,8 +204,11 @@ class TextClient:
 
     def complete(self, system_prompt: str, user_text: str) -> str:
         if self._no_think:
-            user_text = f"{user_text}\n\n/no_think"
-        payload = {
+            # No single mechanism is reliable across Qwen3 builds, so send all
+            # three. Qwen's own docs say '/no_think'; Ollama setups commonly use
+            # '/nothink'. Both are inert text to a model that doesn't know them.
+            user_text = f"{user_text}\n\n/nothink /no_think"
+        payload: dict[str, Any] = {
             "model": self._model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -164,6 +218,20 @@ class TextClient:
             "max_tokens": self._max_tokens,
             "stream": False,
         }
+        if self._no_think:
+            # Ollama's native switch. Unknown keys are ignored by Ollama and by
+            # every OpenAI-compatible server we care about, so this is safe to
+            # send unconditionally once the user has opted into no-think.
+            payload["think"] = False
+        if self._structured:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "transcript_summary",
+                    "schema": SUMMARY_JSON_SCHEMA,
+                    "strict": True,
+                },
+            }
         try:
             resp = self._session.post(self._url, json=payload, timeout=self._timeout)
         except requests.exceptions.Timeout as exc:
@@ -173,16 +241,53 @@ class TextClient:
         except requests.exceptions.RequestException as exc:
             raise SummariseError(f"Text request failed ({self._url}): {exc}") from exc
 
+        # A 400 with response_format set almost always means "this endpoint
+        # doesn't do json_schema". Drop the constraint for the rest of the run
+        # and retry once, rather than failing every asset over a capability the
+        # caller never asked for explicitly.
+        if resp.status_code == 400 and self._structured:
+            self._structured = False
+            print(
+                f"[summarise] {self._url} rejected json_schema "
+                f"(HTTP 400) — falling back to unconstrained JSON for this run.",
+                file=sys.stderr,
+            )
+            return self.complete(system_prompt, user_text)
+
         if resp.status_code != 200:
             raise SummariseError(
                 f"Text endpoint returned HTTP {resp.status_code}: {resp.text[:500]}"
             )
         try:
-            content = resp.json()["choices"][0]["message"]["content"]
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            message = resp.json()["choices"][0]["message"]
+            content = message.get("content")
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
             raise SummariseError(
                 f"Unexpected text response shape: {resp.text[:500]}"
             ) from exc
+
+        # Reasoning models on Ollama put the chain-of-thought in a SEPARATE
+        # field and leave 'content' empty when the whole token budget went on
+        # thinking. Reading only 'content' made that look like "the model
+        # returned nothing", which is what it looked like for a whole run.
+        if not (content or "").strip():
+            reasoning = (
+                message.get("reasoning_content")
+                or message.get("reasoning")
+                or message.get("thinking")
+                or ""
+            )
+            if reasoning:
+                raise SummariseError(
+                    f"{self._model} spent its entire {self._max_tokens}-token budget "
+                    f"thinking and returned no answer. Set TEXT_NO_THINK=true, raise "
+                    f"TEXT_MAX_TOKENS, or use a non-reasoning model. "
+                    f"Reasoning began: {reasoning.strip()[:200]!r}"
+                )
+            raise SummariseError(
+                f"{self._model} returned an empty reply with no reasoning field. "
+                f"Raw response: {resp.text[:300]}"
+            )
         if not isinstance(content, str):
             raise SummariseError(f"Text response content was not text: {content!r}")
         return content
@@ -195,7 +300,7 @@ def parse_summary(raw: str, fallback_text: str = "") -> Summary:
     the caller always has *something* human-readable, flagged with ok=False.
     """
     fallback = Summary(
-        summary=fallback_text[:300].strip(),
+        summary=_clip(fallback_text.strip()),
         topics=[],
         spoken_language=None,
         has_useful_content=bool(fallback_text.strip()),
@@ -237,7 +342,7 @@ def parse_summary(raw: str, fallback_text: str = "") -> Summary:
     lang = str(lang).strip().lower() if lang else None
 
     return Summary(
-        summary=summary[:300],
+        summary=_clip(summary),
         topics=topics[:8],
         spoken_language=lang,
         has_useful_content=bool(data.get("has_useful_content", True)),

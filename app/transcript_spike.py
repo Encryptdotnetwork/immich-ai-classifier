@@ -92,9 +92,11 @@ def run(
     if cfg.text.configured:
         text_client = TextClient(
             cfg.text, max_tokens=cfg.text_max_tokens, no_think=cfg.text_no_think,
+            structured=cfg.text_structured,
         )
         print(f"Summariser        : {cfg.text.model} "
               f"(max_tokens={cfg.text_max_tokens}"
+              f"{', schema-constrained' if cfg.text_structured else ''}"
               f"{', /no_think' if cfg.text_no_think else ''})")
     else:
         print("Summariser        : DISABLED (TEXT_ENDPOINT / TEXT_MODEL not set)")
