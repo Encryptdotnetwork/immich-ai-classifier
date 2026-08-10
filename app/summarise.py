@@ -35,6 +35,26 @@ MAX_TRANSCRIPT_CHARS = 12000
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
+# Reasoning models (Qwen3, DeepSeek-R1 and friends) emit a chain-of-thought
+# block before the answer, and Ollama leaves it on by default. That block
+# routinely contains braces — the model talking itself through the JSON shape —
+# which would defeat the outermost-brace slice below and fail every parse.
+# Stripping it here keeps the parser model-agnostic; relying on a prompt
+# convention like /no_think instead would break silently on a model swap.
+# The second pattern catches a block truncated by max_tokens (no closing tag).
+_THINK_RE = re.compile(r"<(think|thinking)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+_UNCLOSED_THINK_RE = re.compile(r"^\s*<(think|thinking)\b[^>]*>.*$", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(text: str) -> str:
+    """Remove <think>...</think> blocks a reasoning model prepends to its answer."""
+    cleaned = _THINK_RE.sub("", text)
+    # An unclosed block means the reply was cut off mid-reasoning: there is no
+    # answer in there to recover, so blank it and let the caller fall back.
+    if _UNCLOSED_THINK_RE.match(cleaned):
+        return ""
+    return cleaned.strip()
+
 SYSTEM_PROMPT = (
     "You summarise transcripts of short videos. You are given the speech-to-text "
     "output of one video. It may be noisy, unpunctuated or partial.\n\n"
@@ -163,7 +183,7 @@ def parse_summary(raw: str, fallback_text: str = "") -> Summary:
     if not isinstance(raw, str):
         return fallback
 
-    text = raw.strip()
+    text = strip_reasoning(raw.strip())
     fence = _FENCE_RE.search(text)
     if fence:
         text = fence.group(1).strip()

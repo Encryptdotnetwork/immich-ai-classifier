@@ -91,6 +91,36 @@ def test_parse_summary_degrades_to_transcript_excerpt():
     assert s.summary == "a" * 300
 
 
+def test_parse_summary_strips_qwen3_thinking_block():
+    """Qwen3 has thinking ON by default in Ollama, and the block contains braces."""
+    raw = (
+        '<think>The user wants JSON. I should use {"summary": ...} with a topics '
+        'array. Let me think about what { and } to emit.</think>\n'
+        '{"summary": "A clip about position sizing.", "topics": ["trading"], '
+        '"has_useful_content": true}'
+    )
+    s = parse_summary(raw)
+    assert s.ok is True
+    assert s.summary == "A clip about position sizing."
+    assert s.topics == ["trading"]
+
+
+def test_parse_summary_strips_thinking_wrapped_in_fences():
+    raw = (
+        "<thinking>reasoning with a { brace }</thinking>\n"
+        '```json\n{"summary": "Hello.", "topics": [], "has_useful_content": true}\n```'
+    )
+    assert parse_summary(raw).ok is True
+
+
+def test_truncated_thinking_block_falls_back_instead_of_parsing_garbage():
+    """max_tokens cut the reply mid-reasoning: there is no answer to recover."""
+    raw = '<think>I am reasoning about {this} and never finish'
+    s = parse_summary(raw, fallback_text="the raw transcript text")
+    assert s.ok is False
+    assert s.summary == "the raw transcript text"
+
+
 def test_parse_summary_caps_topics_at_eight():
     raw = '{"summary": "x", "topics": %s}' % str([f"t{i}" for i in range(20)]).replace("'", '"')
     assert len(parse_summary(raw).topics) == 8
