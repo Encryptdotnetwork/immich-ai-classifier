@@ -250,6 +250,7 @@ def run(argv: list[str]) -> int:
     limit: int | None = None
     album: str | None = None
     tag: str | None = None
+    keep_tags: tuple[str, ...] = ()
     args = argv[1:]
     i = 0
     while i < len(args):
@@ -268,6 +269,12 @@ def run(argv: list[str]) -> int:
         elif a == "--tag":
             i += 1
             tag = args[i] if i < len(args) else None
+        elif a == "--keep-tags":
+            i += 1
+            if i < len(args):
+                keep_tags = tuple(
+                    t.strip() for t in args[i].split(",") if t.strip()
+                )
         elif a.startswith("-"):
             flags.add(a)
         else:
@@ -283,7 +290,13 @@ def run(argv: list[str]) -> int:
             cfg, client, commit=commit, limit=limit, album=album, tag=tag,
             asset_ids=positionals, include_human_edited="--include-human-edited" in flags,
             skip_sourced="--skip-sourced" in flags,
-            prune_tags="--prune-tags" in flags,
+            # --prune-all-tags implies --prune-tags: you cannot widen a prune
+            # you never asked for.
+            prune_tags=bool(flags & {"--prune-tags", "--prune-all-tags"}),
+            prune_all_tags="--prune-all-tags" in flags,
+            keep_tags=keep_tags,
+            asset_type=("VIDEO" if "--videos" in flags
+                        else "IMAGE" if "--images" in flags else None),
         )
 
     # Batch mode sources assets from the album; no asset id needed.

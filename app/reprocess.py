@@ -52,31 +52,48 @@ SOURCE_TAG_PREFIX = "source:"
 
 
 def stale_tags_to_remove(
-    cached_tags: list[str], planned_tags: list[str], tax: Any
+    cached_tags: list[str], planned_tags: list[str], tax: Any, *,
+    current_tags: Optional[list[str]] = None, marker_scoped: bool = False,
+    keep_tags: tuple[str, ...] = (),
 ) -> list[str]:
-    """Tags THIS TOOL wrote on a previous run that the new plan no longer wants.
+    """Tags to strip because the new plan no longer wants them.
 
-    The whole safety property lives here. We only ever propose removing tags the
-    cache records us writing, because that is the only set we can prove we own.
-    A tag added by hand in the Immich UI was never in the cache, so it can never
-    appear in this list. IMGCLASS-15 was a silent tag-loss incident; the lesson
-    taken from it is that this tool removes only what it can prove is its own.
+    Two scopes, both of which must be able to prove authorship before removing
+    anything. IMGCLASS-15 was a silent tag-loss incident, so the rule is that
+    this tool only removes what it can show is its own.
 
-    Never removed, even when the cache claims them:
+    CACHE-SCOPED (default). Candidates are the tags cache.db records us writing
+    last run. Provably ours, but the cache only holds the MOST RECENT run, so
+    tags from an earlier pass that a later one overwrote are invisible. Measured
+    on real assets: this left 'animation', 'freedom-of-speech' and
+    'political-commentary' behind while adding 'free-speech' and 'politics',
+    growing a 7-tag asset to 10.
+
+    MARKER-SCOPED (marker_scoped=True). Candidates are the asset's CURRENT tags,
+    used only when the asset carries the marker tag. The marker is written by
+    this tool and nothing else, so its presence is evidence we filed this asset
+    and are therefore the author of its tags. Without the marker we fall back to
+    cache-scoped, because an asset we never filed is not ours to tidy.
+
+    Never removed under either scope:
       - the marker tag: it records that we filed this asset at all
       - the review tag: reprocess strips that separately, after the album move
       - source:<platform>: expensive to derive, needs a frontier model to get
         right, and a weak local pass routinely fails to re-emit it. Losing these
         was the exact damage in IMGCLASS-15.
-
-    Known limitation: the cache holds only the MOST RECENT run's tag list, so
-    tags from two runs ago (e.g. a June pass later overwritten by an August one)
-    are invisible here and will not be proposed for removal.
+      - anything in keep_tags: the explicit escape hatch for hand-added tags
     """
-    protected = {tax.marker_tag, tax.review.tag_name}
+    protected = {tax.marker_tag, tax.review.tag_name, *keep_tags}
     planned = set(planned_tags)
+
+    current = list(current_tags or [])
+    if marker_scoped and current and tax.marker_tag in set(current):
+        candidates = current
+    else:
+        candidates = list(cached_tags)
+
     out: list[str] = []
-    for tag in cached_tags:
+    for tag in candidates:
         if tag in planned or tag in protected:
             continue
         if tag.lower().startswith(SOURCE_TAG_PREFIX):
@@ -89,40 +106,61 @@ def stale_tags_to_remove(
 def _resolve_scope(
     cfg: Config, client: ImmichClient, *,
     album: Optional[str], tag: Optional[str], asset_ids: list[str], limit: Optional[int],
+    asset_type: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[list[dict[str, Any]]], int]:
-    """Return (label, assets, total). assets is None on error (message printed)."""
+    """Return (label, assets, total). assets is None on error (message printed).
+
+    ``asset_type`` ('VIDEO'/'IMAGE') narrows any of the scopes below, and can
+    ALSO stand alone as the whole scope — which is how you reprocess every video
+    in the library without naming an album. Transcription only applies to video,
+    so running the transcript-informed pass across everything would otherwise
+    mean paying for a vision call on thousands of images for no added signal.
+    """
     if asset_ids:
         ids = asset_ids[:limit] if limit else asset_ids
         return f"ids[{len(ids)}]", [client.get_asset(a) for a in ids], len(asset_ids)
+
+    body: dict[str, Any] = {}
+    label_bits: list[str] = []
+    if asset_type:
+        body["type"] = asset_type
+        label_bits.append(f"type:{asset_type}")
+
     if album:
         album_id = _resolve_album_id(client, album)
         if not album_id:
             print(f"!! Scope album {album!r} not found.", file=sys.stderr)
             return None, None, 0
-        items, total = search_paginated(
-            client, {"albumIds": [album_id]}, limit, visibility=cfg.search_visibility
-        )
-        return f"album:{album}", items, total
-    if tag:
+        body["albumIds"] = [album_id]
+        label_bits.append(f"album:{album}")
+    elif tag:
         tag_id = next(
             (t["id"] for t in client.get_tags() if (t.get("value") or t.get("name")) == tag), None
         )
         if not tag_id:
             print(f"!! Scope tag {tag!r} not found.", file=sys.stderr)
             return None, None, 0
-        items, total = search_paginated(
-            client, {"tagIds": [tag_id]}, limit, visibility=cfg.search_visibility
+        body["tagIds"] = [tag_id]
+        label_bits.append(f"tag:{tag}")
+    elif not asset_type:
+        print(
+            "!! No scope given. Use --album <name>, --tag <name>, --videos, "
+            "or asset ids.", file=sys.stderr,
         )
-        return f"tag:{tag}", items, total
-    print("!! No scope given. Use --album <name>, --tag <name>, or asset ids.", file=sys.stderr)
-    return None, None, 0
+        return None, None, 0
+
+    items, total = search_paginated(
+        client, body, limit, visibility=cfg.search_visibility
+    )
+    return " ".join(label_bits), items, total
 
 
 def run_reprocess(
     cfg: Config, client: ImmichClient, *, commit: bool, limit: Optional[int],
     album: Optional[str], tag: Optional[str], asset_ids: list[str],
     include_human_edited: bool, skip_sourced: bool = False,
-    prune_tags: bool = False,
+    prune_tags: bool = False, asset_type: Optional[str] = None,
+    prune_all_tags: bool = False, keep_tags: tuple[str, ...] = (),
 ) -> int:
     if not cfg.vision.configured:
         print("[config] Reprocess needs VISION_ENDPOINT and VISION_MODEL set.", file=sys.stderr)
@@ -134,9 +172,9 @@ def run_reprocess(
     if transcriber is not None:
         print(f"Transcripts     : {cfg.whisper.model} on {cfg.whisper.device} "
               f"(video assets only)")
-
     label, assets, total = _resolve_scope(
-        cfg, client, album=album, tag=tag, asset_ids=asset_ids, limit=limit
+        cfg, client, album=album, tag=tag, asset_ids=asset_ids, limit=limit,
+        asset_type=asset_type,
     )
     if assets is None:
         return 2
@@ -150,6 +188,14 @@ def run_reprocess(
     print(f"Scope size      : {total}")
     print(f"Processing      : {len(assets)}{'  (--limit)' if limit else ''}")
     print(f"Review threshold: {tax.review.threshold}")
+    if prune_tags:
+        print("Tag prune       : " + (
+            "MARKER-SCOPED — every tag on a marker-tagged asset is a candidate"
+            if prune_all_tags else
+            "cache-scoped — only tags cache.db records us writing last run"
+        ))
+        print(f"  protected     : {tax.marker_tag}, {tax.review.tag_name}, source:*"
+              + (", " + ", ".join(keep_tags) if keep_tags else ""))
     print(f"Cache override  : ON (reprocess re-classifies even if checksum unchanged)")
     if tax.source_detection.process_only:
         print(f"Source filter   : only filing source={tax.source_detection.process_only}")
@@ -231,12 +277,23 @@ def run_reprocess(
                 known_tags=known_tags, known_albums=known_albums,
             )
 
-            # Stale tags: what we wrote last run that this run no longer wants.
-            # Computed even in dry-run so the report shows the real proposal.
+            # Stale tags: what the new plan no longer wants. Computed even in
+            # dry-run so the report shows the real proposal. The live read is
+            # the PRE-write state, which is what both scopes reason about.
             planned_tag_values = [tp.normalized for tp in plan.tags]
-            stale = stale_tags_to_remove(
-                (cached.get("tags") if cached else []) or [], planned_tag_values, tax,
-            ) if prune_tags else []
+            live_tags: list[str] = []
+            stale: list[str] = []
+            if prune_tags:
+                live_tags = [
+                    (t.get("value") or t.get("name"))
+                    for t in (client.get_asset(asset_id).get("tags") or [])
+                    if isinstance(t, dict)
+                ]
+                stale = stale_tags_to_remove(
+                    (cached.get("tags") if cached else []) or [], planned_tag_values,
+                    tax, current_tags=live_tags, marker_scoped=prune_all_tags,
+                    keep_tags=keep_tags,
+                )
 
             # --- DRY-RUN: print the planned move, write nothing ---
             if not commit:
@@ -255,17 +312,10 @@ def run_reprocess(
                     print(f"  transcript      : FAILED — {result['transcript_error']}")
                 if prune_tags:
                     # ADD is measured against the asset's ACTUAL current tags,
-                    # not the cache. The cache only knows what we wrote last
-                    # run, so diffing against it reported things like
-                    # 'source:tiktok' as an addition when the asset already
-                    # carried it. REMOVE still uses the cache, deliberately —
-                    # that restriction is the safety property.
-                    live_tags = {
-                        (t.get("value") or t.get("name"))
-                        for t in (client.get_asset(asset_id).get("tags") or [])
-                        if isinstance(t, dict)
-                    }
-                    added = [t for t in planned_tag_values if t not in live_tags]
+                    # not the cache — diffing against the cache reported things
+                    # like 'source:tiktok' as an addition when the asset already
+                    # carried it.
+                    added = [t for t in planned_tag_values if t not in set(live_tags)]
                     if added:
                         print(f"  tags ADD        : {added}")
                     if stale:
