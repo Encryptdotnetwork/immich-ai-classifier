@@ -6,3 +6,8 @@ Pillow==10.4.0
 moviepy==1.0.3
 # Category taxonomy config (config/categories.yaml -> app/taxonomy.py).
 PyYAML==6.0.2
+# Speech-to-text (app/transcribe.py), video assets only, opt-in via
+# WHISPER_ENABLED. Pulls CTranslate2 + tokenizers; adds roughly 400MB to the
+# image. Model weights are NOT baked in — they download on first use to
+# WHISPER_DOWNLOAD_ROOT, which compose maps to the host app-data dir.
+faster-whisper==1.1.1

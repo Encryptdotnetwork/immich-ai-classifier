@@ -60,7 +60,9 @@ def _resolve_scope(
         if not album_id:
             print(f"!! Scope album {album!r} not found.", file=sys.stderr)
             return None, None, 0
-        items, total = search_paginated(client, {"albumIds": [album_id]}, limit)
+        items, total = search_paginated(
+            client, {"albumIds": [album_id]}, limit, visibility=cfg.search_visibility
+        )
         return f"album:{album}", items, total
     if tag:
         tag_id = next(
@@ -69,7 +71,9 @@ def _resolve_scope(
         if not tag_id:
             print(f"!! Scope tag {tag!r} not found.", file=sys.stderr)
             return None, None, 0
-        items, total = search_paginated(client, {"tagIds": [tag_id]}, limit)
+        items, total = search_paginated(
+            client, {"tagIds": [tag_id]}, limit, visibility=cfg.search_visibility
+        )
         return f"tag:{tag}", items, total
     print("!! No scope given. Use --album <name>, --tag <name>, or asset ids.", file=sys.stderr)
     return None, None, 0

@@ -69,6 +69,12 @@ class _Item:
 
 # --- enumeration ----------------------------------------------------------
 
+# What a classification run considers "the library". Immich 2.x used this as the
+# search default; Immich 3.0 dropped that default, so we send it ourselves.
+# Overridable per-run via SEARCH_VISIBILITY (see app/config.py).
+DEFAULT_SEARCH_VISIBILITY = "timeline"
+
+
 def _resolve_album_id(client: ImmichClient, name: str) -> Optional[str]:
     for a in client.get_albums() or []:
         if a.get("albumName") == name:
@@ -78,19 +84,28 @@ def _resolve_album_id(client: ImmichClient, name: str) -> Optional[str]:
 
 def search_paginated(
     client: ImmichClient, body_filter: dict[str, Any], limit: Optional[int],
-    page_size: int = _PAGE_SIZE,
+    page_size: int = _PAGE_SIZE, visibility: Optional[str] = DEFAULT_SEARCH_VISIBILITY,
 ) -> tuple[list[dict[str, Any]], int]:
     """Paginate POST /api/search/metadata with the given filter (albumIds /
     tagIds / ...). Returns (assets, total).
 
     'total' is the real match count reported by search (NOT the ~1000-capped
     GET /api/albums/{id}); we stop early once we have 'limit' assets.
+
+    ``visibility`` is ALWAYS sent explicitly. Immich 2.x defaulted to 'timeline'
+    when it was omitted; Immich 3.0 changed that default to ANY visibility, so
+    an omitted filter means a server upgrade silently widens every run to
+    include archived and hidden assets. Pass None to genuinely omit it (i.e. to
+    opt into the v3 any-visibility behaviour); a 'visibility' key already
+    present in body_filter always wins.
     """
     collected: list[dict[str, Any]] = []
     total: Optional[int] = None
     page = 1
     while True:
         body = {**body_filter, "page": page, "size": page_size, "withExif": True}
+        if visibility is not None and "visibility" not in body_filter:
+            body["visibility"] = visibility
         resp = client.search_metadata(body) or {}
         block = resp.get("assets") or {}
         if total is None:
@@ -109,10 +124,12 @@ def search_paginated(
 
 def _enumerate(
     client: ImmichClient, album_id: str, limit: Optional[int],
-    page_size: int = _PAGE_SIZE,
+    page_size: int = _PAGE_SIZE, visibility: Optional[str] = DEFAULT_SEARCH_VISIBILITY,
 ) -> tuple[list[dict[str, Any]], int]:
     """Stage 4 album enumeration (thin wrapper over search_paginated)."""
-    return search_paginated(client, {"albumIds": [album_id]}, limit, page_size)
+    return search_paginated(
+        client, {"albumIds": [album_id]}, limit, page_size, visibility
+    )
 
 
 # --- per-asset decisions --------------------------------------------------
@@ -247,8 +264,11 @@ def run_batch(
         print(f"!! Source album {cfg.source_album!r} not found.", file=sys.stderr)
         return 2
 
-    assets, total_found = _enumerate(client, src_id, limit)
-    print(f"Total found     : {total_found}  (paginated via search/metadata)")
+    assets, total_found = _enumerate(
+        client, src_id, limit, visibility=cfg.search_visibility
+    )
+    print(f"Total found     : {total_found}  (paginated via search/metadata, "
+          f"visibility={cfg.search_visibility})")
     print(f"Processing      : {len(assets)}{'  (--limit)' if limit else ''}")
     print(f"Review threshold: {tax.review.threshold}   group size: {cfg.batch_group_size}")
     if tax.source_detection.process_only:

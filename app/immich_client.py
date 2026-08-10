@@ -96,7 +96,14 @@ class ImmichClient:
         return self._get("albums", params={"assetId": asset_id})
 
     def get_album(self, album_id: str) -> dict[str, Any]:
-        """GET /api/albums/{id} — album incl. its assets (for membership re-read)."""
+        """GET /api/albums/{id} — album metadata (name, assetCount, createdAt).
+
+        DO NOT read ``.assets`` off this. ``AlbumResponseDto.assets`` was REMOVED
+        in Immich 3.0; enumerate album membership with search_metadata and
+        ``albumIds`` instead (see app/dedupe_albums.py._album_asset_ids). Album
+        membership checks in writer.py go asset-side via get_albums_for_asset
+        and are unaffected.
+        """
         return self._get(f"albums/{album_id}")
 
     def search_metadata(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -138,9 +145,11 @@ class ImmichClient:
 
     # --- removals (Stage 5 move-not-add) --------------------------------
     # These remove ALBUM MEMBERSHIP / a TAG — they never delete an asset.
-    # Paths are for Immich 2.7.5. NOTE: if Immich is upgraded to v3.x the
-    # album-asset routes change (e.g. /api/albums/{id}/assets shape differs) —
-    # revisit these two methods then.
+    # Paths are for Immich 2.7.5 and are UNCHANGED in v3.0: the v3 migration
+    # guide only removes shared-link (unauthenticated) access to
+    # PUT /albums/{id}/assets. An earlier note here claimed these routes change
+    # on v3 — that was wrong. The real v3 breakage is AlbumResponseDto.assets
+    # being removed (see get_album above).
 
     def remove_assets_from_album(self, album_id: str, asset_ids: list[str]) -> Any:
         """DELETE /api/albums/{id}/assets — remove assets from an album (NOT delete)."""

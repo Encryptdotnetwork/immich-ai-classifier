@@ -25,14 +25,47 @@ import time
 from collections import defaultdict
 from typing import Any, Optional
 
+from .batch import search_paginated
 from .config import ConfigError, load_config
 from .immich_client import ImmichClient
 from .writer import _asset_in_album
 
 
-def _album_asset_ids(client: ImmichClient, album_id: str) -> list[str]:
-    album = client.get_album(album_id) or {}
-    return [a.get("id") for a in album.get("assets", []) if a.get("id")]
+class EnumerationMismatch(RuntimeError):
+    """Album membership could not be enumerated in full. Never delete on this."""
+
+
+def _album_asset_ids(
+    client: ImmichClient, album_id: str, expected: Optional[int] = None,
+    visibility: Optional[str] = None,
+) -> list[str]:
+    """Every asset id in an album, via search/metadata.
+
+    v3 BREAKING: this used to read ``album["assets"]`` from GET /api/albums/{id},
+    but Immich 3.0 REMOVED the ``assets`` property from AlbumResponseDto. On v3
+    that read silently returns [], which in --commit mode would have deleted a
+    duplicate album WITHOUT moving its assets to the canonical first. The assets
+    would survive (deleting an album never deletes photos) but they would be
+    stranded outside the canonical album. Hence search/metadata plus the count
+    cross-check below.
+
+    ``visibility`` is None here on purpose: album membership is membership,
+    regardless of whether an asset is archived. A dedupe must move EVERY asset
+    or it must move none, otherwise it strands exactly the ones it can't see.
+    """
+    ids = [a.get("id") for a in search_paginated(
+        client, {"albumIds": [album_id]}, None, visibility=visibility
+    )[0] if a.get("id")]
+
+    # Re-read is truth (writer.py's rule). If the album claims more assets than
+    # we could enumerate, we are about to under-count, and under-counting is
+    # what strands assets. Refuse rather than guess.
+    if expected is not None and len(ids) < int(expected):
+        raise EnumerationMismatch(
+            f"album {album_id} reports {expected} assets but enumeration returned "
+            f"{len(ids)}"
+        )
+    return ids
 
 
 def _pick_canonical(group: list[dict[str, Any]]) -> dict[str, Any]:
@@ -89,7 +122,16 @@ def run(argv: list[str]) -> int:
 
         for dup in others:
             dup_id = dup.get("id")
-            asset_ids = _album_asset_ids(client, dup_id)
+            try:
+                # visibility=None always: the dry-run plan must enumerate the
+                # exact same set the commit will act on.
+                asset_ids = _album_asset_ids(
+                    client, dup_id, expected=dup.get("assetCount"), visibility=None,
+                )
+            except EnumerationMismatch as exc:
+                failed += 1
+                print(f"  [FAIL] {dup_id}  {exc} — album KEPT, nothing moved or deleted")
+                continue
 
             if not commit:
                 print(f"  [plan] {dup_id}  move {len(asset_ids)} asset(s) then delete album")

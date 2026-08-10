@@ -31,7 +31,10 @@ app/
   immich_client.py  # read-only Immich client: get_asset / list_assets / get_tags / get_albums
   paths.py          # translate_path(): Immich-server path -> this container's mount
   vision.py         # OpenAI-compatible vision client (endpoint-agnostic)
-  signals.py        # gather_signals(): image b64 / video frames + OCR hint (Whisper stubbed)
+  signals.py        # gather_signals(): image b64 / video frames + OCR + transcript hints
+  transcribe.py     # local faster-whisper speech-to-text for video (opt-in)
+  summarise.py      # TEXT_* role: transcript -> summary + topics
+  transcript_spike.py # sample videos, transcribe+summarise, dump JSONL. WRITES NOTHING
   classifier.py     # classify -> {category, source, tags, confidence}
   writer.py         # file album+tags+description; verify-and-retry on re-reads
   cache.py          # SQLite cache (skip unchanged, detect human moves)
@@ -336,9 +339,12 @@ reclassifies. Scope via `--album <name>`, `--tag <name>`, or explicit asset ids;
 all enumerate through the same paginated `search/metadata`. `--limit N` supported.
 The `process_only` source filter applies here too.
 
-> Built for Immich **2.7.5** (album object includes its assets; the remove
-> endpoints work). On a future v3.x upgrade the album-asset routes change — see
-> the note on `remove_assets_from_album` in `app/immich_client.py`.
+> Runs on Immich **2.7.5 and 3.1.0**. Two v3 breaking changes are handled:
+> `AlbumResponseDto.assets` was removed (album membership is now enumerated via
+> `search/metadata`), and `POST /search/*` stopped defaulting to `timeline`
+> visibility (we now send `visibility` explicitly on every search — see
+> `SEARCH_VISIBILITY`). The album-asset routes themselves are unchanged in v3,
+> contrary to an earlier note here.
 
 ### Local (no Docker) smoke run
 
@@ -456,5 +462,57 @@ docker compose run --rm immich-ai-classifier python -m app.dedupe_albums --commi
 - `IMMICH_LIBRARY_HOST_PATH` is the Immich `UPLOAD_LOCATION` on disk
   (e.g. `/path/to/immich/library`); it maps to `/usr/src/app/upload` inside
   Immich, which is why `IMMICH_INTERNAL_PREFIX=/usr/src/app/upload`.
-- The `TEXT_*` inference role is a placeholder, captured but unused (the
-  classifier is vision-only; Whisper/transcript is out of scope).
+- The `TEXT_*` inference role now drives transcript summarisation
+  (`app/summarise.py`). Leave it blank to run transcription without summaries.
+
+## Video transcripts — `WHISPER_ENABLED`
+
+Video assets can be transcribed locally with faster-whisper before
+classification. **Off by default.** Turning it on makes every video cost a
+Whisper pass on top of the vision call, so it is an explicit opt-in.
+
+- Runs **in this container**. No audio leaves the host. There is deliberately no
+  remote transcription fallback: audio identifies people far more readily than a
+  still frame, so the local/remote split that `--skip-sourced` makes for vision
+  is not automatically right for speech.
+- ffmpeg decodes audio to 16 kHz mono WAV in a **temp dir outside the mount**.
+  The library mount stays read-only, as with frame extraction.
+- Model weights are **not** baked into the image. They download on first use to
+  `WHISPER_DOWNLOAD_ROOT` (under `/data`, so a rebuild does not re-download).
+- **No speech is not a failure.** Videos with no audio stream, clips longer than
+  `WHISPER_MAX_DURATION`, and transcripts under `WHISPER_MIN_CHARS` all return
+  nothing and are counted separately. A transcription *error* is recorded on the
+  asset and the run continues on frames alone — a broken soundtrack never costs
+  you the asset.
+- The transcript reaches the vision model as a **hint**, capped at 1,500
+  characters, alongside OCR. Speech-to-text mangles proper nouns and jargon,
+  which is exactly the vocabulary that decides a category, so it must not be
+  treated as ground truth.
+
+### Deciding where transcripts live — `app.transcript_spike`
+
+Transcripts are generated but **not yet written to Immich**. Where they belong
+depends on how long they actually are in your library and how good the summaries
+turn out, so the spike produces that evidence before the schema is fixed:
+
+```bash
+docker compose run --rm immich-ai-classifier \
+  python -m app.transcript_spike --album "Saved" --limit 20
+```
+
+It transcribes and summarises a sample, writes one JSON object per asset to
+`/data/transcript-spike.jsonl`, and prints the length distribution plus what
+share of transcripts would fit a given description-field budget. There is no
+`--commit` — it reaches no Immich write endpoint at all.
+
+The options it is there to decide between:
+
+| Option | Transcript searchable in Immich | Description stays readable |
+|---|---|---|
+| Summary in `description`, transcript in own store | no | yes |
+| Summary + full transcript in `description` | yes | no |
+| Summary + keyword excerpt in `description`, full transcript in own store | partly | yes |
+
+Immich does index the description field for search, and auto-queues an XMP
+sidecar write whenever a description changes — so option two makes every spoken
+word findable at the cost of writing walls of text into sidecar files.

@@ -27,15 +27,34 @@ _BASE_USER_TEXT = (
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
-def build_user_text(ocr_text: str | None) -> str:
-    """User message. Includes OCR as an optional hint when present (never required)."""
+# A long transcript pasted into a vision prompt crowds out the image itself and
+# blows small local models' context. The opening of a short-form clip almost
+# always states its subject, so a head excerpt is the high-value slice.
+TRANSCRIPT_HINT_CHARS = 1500
+
+
+def build_user_text(ocr_text: str | None, transcript_text: str | None = None) -> str:
+    """User message, with OCR and transcript as optional hints (never required).
+
+    Both are HINTS. The image remains the primary evidence: speech-to-text on a
+    saved clip is frequently wrong about proper nouns and jargon, which is
+    exactly the vocabulary that decides a category. Framing them as hints stops
+    the model treating a garbled transcript as ground truth.
+    """
+    parts = [_BASE_USER_TEXT]
     if ocr_text:
-        return (
-            _BASE_USER_TEXT
-            + "\n\nOCR text was detected in the image. Treat it as a hint only; "
-            "it may be partial or noisy:\n\"\"\"\n" + ocr_text + "\n\"\"\""
+        parts.append(
+            "OCR text was detected in the image. Treat it as a hint only; "
+            'it may be partial or noisy:\n"""\n' + ocr_text + '\n"""'
         )
-    return _BASE_USER_TEXT
+    if transcript_text:
+        excerpt = transcript_text.strip()[:TRANSCRIPT_HINT_CHARS]
+        parts.append(
+            "The video's spoken audio was transcribed. Treat it as a hint only; "
+            "speech-to-text often mangles names and technical terms:\n"
+            '"""\n' + excerpt + '\n"""'
+        )
+    return "\n\n".join(parts)
 
 
 def parse_classification(raw: str) -> dict[str, Any]:
@@ -121,19 +140,29 @@ def _select_image_bytes(signals: dict[str, Any]) -> bytes:
 
 
 def classify_asset(
-    asset: dict[str, Any], cfg: Config, vision_client: Any, client: Any
+    asset: dict[str, Any],
+    cfg: Config,
+    vision_client: Any,
+    client: Any,
+    transcriber: Any = None,
 ) -> dict[str, Any]:
     """Gather signals, run the vision model, parse the result. NO writes.
 
     ``client`` is the ImmichClient — needed so signal gathering can fetch the
     JPEG preview for HEIC/HEIF assets the vision endpoint can't decode.
+    ``transcriber`` is the optional WhisperTranscriber; None keeps the exact
+    pre-Whisper behaviour.
     """
-    signals = gather_signals(asset, cfg, client)
+    signals = gather_signals(asset, cfg, client, transcriber)
     image_bytes = _select_image_bytes(signals)
     ocr_text = signals.get("ocr_text")
+    transcript = signals.get("transcript")
+    transcript_text = transcript.text if transcript else None
 
     raw = vision_client.vision_complete(
-        image_bytes, load_taxonomy().system_prompt, build_user_text(ocr_text)
+        image_bytes,
+        load_taxonomy().system_prompt,
+        build_user_text(ocr_text, transcript_text),
     )
 
     result = parse_classification(raw)
@@ -141,4 +170,7 @@ def classify_asset(
     result["ocr_available"] = bool(ocr_text)
     result["asset_type"] = signals.get("type")
     result["num_frames"] = len(signals["frames"]) if signals.get("frames") else None
+    result["transcript"] = transcript
+    result["transcript_available"] = bool(transcript_text)
+    result["transcript_error"] = signals.get("transcript_error")
     return result

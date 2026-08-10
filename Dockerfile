@@ -8,7 +8,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# ffmpeg is required by MoviePy for video frame extraction (signals.py).
+# ffmpeg is required by MoviePy for video frame extraction (signals.py) and by
+# app/transcribe.py to decode audio to 16 kHz mono WAV. ffprobe ships with it and
+# is used to detect videos that carry no audio stream at all.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*

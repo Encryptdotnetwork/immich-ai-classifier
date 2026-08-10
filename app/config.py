@@ -68,6 +68,19 @@ def _optional_float(name: str, default: float) -> float:
         raise ConfigError(f"{name} must be a number, got {raw!r}.") from exc
 
 
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off", ""}
+
+
+def _optional_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return default if raw == "" else False
+    raise ConfigError(f"{name} must be a boolean (true/false), got {raw!r}.")
+
+
 @dataclass(frozen=True)
 class InferenceRole:
     """Placeholder config for one OpenAI-compatible inference role.
@@ -84,6 +97,26 @@ class InferenceRole:
     @property
     def configured(self) -> bool:
         return bool(self.endpoint and self.model)
+
+
+@dataclass(frozen=True)
+class WhisperConfig:
+    """Local speech-to-text settings (app/transcribe.py).
+
+    Runs faster-whisper INSIDE this container — no audio leaves the host. Off by
+    default: enabling it changes what every video asset costs to process, so it
+    must be an explicit opt-in rather than a silent behaviour change on upgrade.
+    """
+
+    enabled: bool = False
+    model: str = "base"  # faster-whisper size or a local model dir
+    device: str = "cpu"  # 'cpu' or 'cuda'
+    compute_type: str = "int8"  # 'int8' (cpu), 'float16' (gpu), ...
+    language: str = ""  # ISO code, or '' to auto-detect
+    beam_size: int = 5
+    max_duration: float = 900.0  # seconds; skip longer videos (0 = no limit)
+    min_chars: int = 20  # below this, treat as "no useful speech"
+    download_root: str = "/data/whisper-models"  # model weight cache (container path)
 
 
 @dataclass(frozen=True)
@@ -118,6 +151,18 @@ class Config:
     batch_group_size: int  # assets per tag/verify group (amortises the delay)
     batch_pause: float  # seconds to pause between inference calls (rate-sense)
 
+    # Visibility filter sent with every POST /api/search/metadata.
+    # Immich 2.x defaulted to 'timeline' when this was omitted; Immich 3.0
+    # changed the default to ANY visibility, which would silently pull archived
+    # and hidden assets into a run. We now always send it explicitly.
+    # Set to 'archive' to deliberately classify archived assets instead.
+    search_visibility: str = "timeline"
+
+    # --- Speech-to-text (see app/transcribe.py) ---
+    # Defaults to a disabled WhisperConfig so existing callers and tests that
+    # build a Config without it keep the exact pre-Whisper behaviour.
+    whisper: WhisperConfig = field(default_factory=WhisperConfig, repr=False)
+
     @property
     def api_base(self) -> str:
         """Immich API base, normalised to '<host>/api' with no trailing slash."""
@@ -149,6 +194,18 @@ class Config:
             app_data_dir=_optional("APP_DATA_DIR", "/data"),
             batch_group_size=_optional_int("BATCH_GROUP_SIZE", 25),
             batch_pause=_optional_float("BATCH_PAUSE", 0.0),
+            search_visibility=_optional("SEARCH_VISIBILITY", "timeline"),
+            whisper=WhisperConfig(
+                enabled=_optional_bool("WHISPER_ENABLED", False),
+                model=_optional("WHISPER_MODEL", "base"),
+                device=_optional("WHISPER_DEVICE", "cpu"),
+                compute_type=_optional("WHISPER_COMPUTE_TYPE", "int8"),
+                language=_optional("WHISPER_LANGUAGE"),
+                beam_size=_optional_int("WHISPER_BEAM_SIZE", 5),
+                max_duration=_optional_float("WHISPER_MAX_DURATION", 900.0),
+                min_chars=_optional_int("WHISPER_MIN_CHARS", 20),
+                download_root=_optional("WHISPER_DOWNLOAD_ROOT", "/data/whisper-models"),
+            ),
         )
 
 

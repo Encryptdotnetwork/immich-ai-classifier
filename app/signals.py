@@ -1,9 +1,10 @@
 """Signal gathering: turn an Immich asset into model-ready inputs.
 
 For an image: read the file off the read-only mount (via path translation) and
-base64-encode it. For a video: extract a few evenly-spaced frames (MoviePy).
+base64-encode it. For a video: extract a few evenly-spaced frames (MoviePy) and,
+when Whisper is enabled, transcribe the audio locally (see app/transcribe.py).
 OCR text is included only when Immich already has it on the asset — never
-assumed (see [[immich-ocr-via-exifinfo]]). Whisper is stubbed.
+assumed (see [[immich-ocr-via-exifinfo]]).
 
 This module reads only; it never writes to Immich storage.
 """
@@ -20,6 +21,7 @@ import requests
 from .config import Config
 from .immich_client import ImmichClient
 from .paths import translate_path
+from .transcribe import TranscribeError, WhisperTranscriber
 
 NUM_VIDEO_FRAMES = 5
 
@@ -139,19 +141,28 @@ def _extract_frames(local_path: str, num_frames: int = NUM_VIDEO_FRAMES) -> list
 
 
 def gather_signals(
-    asset: dict[str, Any], cfg: Config, client: ImmichClient
+    asset: dict[str, Any],
+    cfg: Config,
+    client: ImmichClient,
+    transcriber: Optional[WhisperTranscriber] = None,
 ) -> dict[str, Any]:
     """Build the model-ready signal bundle for one asset.
 
     Returns:
-        {asset_id, type, image_b64 | frames, ocr_text, transcript}
+        {asset_id, type, image_b64 | frames, ocr_text, transcript, transcript_error}
         - image assets: ``image_b64`` set, ``frames`` None.
         - video assets: ``frames`` set (list of base64 JPEGs), ``image_b64`` None.
+        - ``transcript`` is a Transcript object, or None when Whisper is off, the
+          asset is an image, or the clip carries no useful speech.
 
     Read strategy: JPEG/PNG images and videos are read straight off the read-only
     mount (fast, full resolution — preserves text for OCR-style screenshots).
     HEIC/HEIF images are pulled from the Immich JPEG preview via the API instead,
     because the vision endpoint cannot decode HEIC originals and returns HTTP 400.
+
+    Transcription failures are RECORDED, not raised. A clip whose audio will not
+    decode still has perfectly good frames, and losing the whole asset over its
+    soundtrack would be a regression on the pre-Whisper behaviour.
     """
     asset_type = asset.get("type")
 
@@ -164,11 +175,18 @@ def gather_signals(
         "image_b64": None,
         "frames": None,
         "ocr_text": ocr_text,
-        "transcript": None,  # TODO: whisper — stubbed, do not block this stage
+        "transcript": None,
+        "transcript_error": None,
     }
 
     if asset_type == "VIDEO":
-        signals["frames"] = _extract_frames(_read_local_file(asset, cfg))
+        local_path = _read_local_file(asset, cfg)
+        signals["frames"] = _extract_frames(local_path)
+        if transcriber is not None:
+            try:
+                signals["transcript"] = transcriber.transcribe(local_path)
+            except TranscribeError as exc:
+                signals["transcript_error"] = str(exc)
     elif _is_heic(asset):
         # No local read: the HEIC original is exactly what the model can't decode.
         signals["image_b64"] = _preview_b64(asset, client)
