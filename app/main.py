@@ -24,6 +24,7 @@ from .immich_client import ImmichClient
 from .paths import translate_path
 from .signals import SignalError, find_ocr_text
 from .taxonomy import TaxonomyError, load_taxonomy
+from .transcribe import build_transcriber
 from .vision import VisionClient, VisionError
 from .writer import build_plan, execute_plan, format_outcome, format_plan
 
@@ -151,7 +152,10 @@ def _run_classify(cfg: Config, client: ImmichClient, asset_id: str, commit: bool
     print("-" * 72)
 
     try:
-        result = classify_asset(asset, cfg, VisionClient(cfg.vision), client)
+        result = classify_asset(
+            asset, cfg, VisionClient(cfg.vision), client,
+            build_transcriber(cfg.whisper),
+        )
     except (VisionError, SignalError) as exc:
         print(f"!! {exc}", file=sys.stderr)
         return 1
@@ -279,6 +283,7 @@ def run(argv: list[str]) -> int:
             cfg, client, commit=commit, limit=limit, album=album, tag=tag,
             asset_ids=positionals, include_human_edited="--include-human-edited" in flags,
             skip_sourced="--skip-sourced" in flags,
+            prune_tags="--prune-tags" in flags,
         )
 
     # Batch mode sources assets from the album; no asset id needed.

@@ -90,8 +90,12 @@ def run(
     # their length distribution, which is most of what the storage decision needs.
     text_client: Optional[TextClient] = None
     if cfg.text.configured:
-        text_client = TextClient(cfg.text)
-        print(f"Summariser        : {cfg.text.model}")
+        text_client = TextClient(
+            cfg.text, max_tokens=cfg.text_max_tokens, no_think=cfg.text_no_think,
+        )
+        print(f"Summariser        : {cfg.text.model} "
+              f"(max_tokens={cfg.text_max_tokens}"
+              f"{', /no_think' if cfg.text_no_think else ''})")
     else:
         print("Summariser        : DISABLED (TEXT_ENDPOINT / TEXT_MODEL not set)")
     print(f"Whisper model     : {cfg.whisper.model} on {cfg.whisper.device}")
@@ -155,6 +159,8 @@ def run(
                     record["summary"] = summary.to_dict()
                     if summary.ok:
                         counts["summarised"] += 1
+                    else:
+                        counts["summary_failed"] = counts.get("summary_failed", 0) + 1
                 except SummariseError as exc:
                     record["error"] = f"summarise: {exc}"
 
@@ -187,6 +193,9 @@ def _report(
     print(f"  no usable speech  : {counts['no_speech']}")
     print(f"  failed            : {counts['failed']}")
     print(f"  summarised ok     : {counts['summarised']}")
+    if counts.get("summary_failed"):
+        print(f"  summary FAILED    : {counts['summary_failed']}  "
+              f"(model reply kept as .summary.raw in the JSONL)")
     print(f"  elapsed           : {elapsed:.1f}s "
           f"({elapsed / max(counts['total'], 1):.1f}s per video)")
 

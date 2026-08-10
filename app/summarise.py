@@ -28,6 +28,11 @@ import requests
 from .config import InferenceRole
 
 TEXT_TIMEOUT = 120  # seconds
+# Reasoning models spend tokens thinking BEFORE they answer, and that budget
+# comes out of max_tokens. At 800 a Qwen3-class model can be cut off mid-<think>
+# and never emit the JSON at all, which looks identical to "the model failed".
+# 2000 leaves room for the reasoning plus the ~200-token answer.
+DEFAULT_MAX_TOKENS = 2000
 # Whisper output for a long clip can exceed a small local model's context. Trim
 # from the middle rather than the tail: the opening states the topic and the
 # close usually carries the takeaway, so both ends matter more than the middle.
@@ -89,13 +94,19 @@ class Summary:
     raw: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "summary": self.summary,
             "topics": self.topics,
             "spoken_language": self.spoken_language,
             "has_useful_content": self.has_useful_content,
             "ok": self.ok,
         }
+        # On failure the model's actual reply is the only thing that explains
+        # WHY, and without it a bad parse is indistinguishable from a bad model.
+        # Only kept when ok is False, so successful runs stay small.
+        if not self.ok:
+            out["raw"] = self.raw[:4000]
+        return out
 
 
 def _trim(text: str, limit: int = MAX_TRANSCRIPT_CHARS) -> str:
@@ -109,7 +120,16 @@ def _trim(text: str, limit: int = MAX_TRANSCRIPT_CHARS) -> str:
 class TextClient:
     """OpenAI-compatible text-only chat client for the TEXT_* role."""
 
-    def __init__(self, role: InferenceRole, timeout: int = TEXT_TIMEOUT) -> None:
+    def __init__(
+        self, role: InferenceRole, timeout: int = TEXT_TIMEOUT,
+        max_tokens: int = DEFAULT_MAX_TOKENS, no_think: bool = False,
+    ) -> None:
+        self._max_tokens = max_tokens
+        # Qwen3 and friends read '/no_think' as an instruction to skip the
+        # reasoning block. Summarising a transcript into two sentences does not
+        # need chain-of-thought, and skipping it roughly thirds the tokens spent
+        # per video. Harmless on models that don't recognise it.
+        self._no_think = no_think
         if not role.configured:
             raise SummariseError(
                 "Text role is not configured (TEXT_ENDPOINT / TEXT_MODEL missing). "
@@ -132,6 +152,8 @@ class TextClient:
         return f"{e}/chat/completions"
 
     def complete(self, system_prompt: str, user_text: str) -> str:
+        if self._no_think:
+            user_text = f"{user_text}\n\n/no_think"
         payload = {
             "model": self._model,
             "messages": [
@@ -139,7 +161,7 @@ class TextClient:
                 {"role": "user", "content": user_text},
             ],
             "temperature": 0,
-            "max_tokens": 800,
+            "max_tokens": self._max_tokens,
             "stream": False,
         }
         try:

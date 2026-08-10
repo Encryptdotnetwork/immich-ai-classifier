@@ -37,6 +37,7 @@ from .config import Config
 from .immich_client import ImmichClient
 from .signals import SignalError
 from .taxonomy import load_taxonomy
+from .transcribe import build_transcriber
 from .vision import VisionClient, VisionError
 from .writer import (
     build_plan,
@@ -45,6 +46,44 @@ from .writer import (
     remove_from_album_verified,
     remove_tag_verified,
 )
+
+
+SOURCE_TAG_PREFIX = "source:"
+
+
+def stale_tags_to_remove(
+    cached_tags: list[str], planned_tags: list[str], tax: Any
+) -> list[str]:
+    """Tags THIS TOOL wrote on a previous run that the new plan no longer wants.
+
+    The whole safety property lives here. We only ever propose removing tags the
+    cache records us writing, because that is the only set we can prove we own.
+    A tag added by hand in the Immich UI was never in the cache, so it can never
+    appear in this list. IMGCLASS-15 was a silent tag-loss incident; the lesson
+    taken from it is that this tool removes only what it can prove is its own.
+
+    Never removed, even when the cache claims them:
+      - the marker tag: it records that we filed this asset at all
+      - the review tag: reprocess strips that separately, after the album move
+      - source:<platform>: expensive to derive, needs a frontier model to get
+        right, and a weak local pass routinely fails to re-emit it. Losing these
+        was the exact damage in IMGCLASS-15.
+
+    Known limitation: the cache holds only the MOST RECENT run's tag list, so
+    tags from two runs ago (e.g. a June pass later overwritten by an August one)
+    are invisible here and will not be proposed for removal.
+    """
+    protected = {tax.marker_tag, tax.review.tag_name}
+    planned = set(planned_tags)
+    out: list[str] = []
+    for tag in cached_tags:
+        if tag in planned or tag in protected:
+            continue
+        if tag.lower().startswith(SOURCE_TAG_PREFIX):
+            continue
+        if tag not in out:
+            out.append(tag)
+    return out
 
 
 def _resolve_scope(
@@ -83,10 +122,18 @@ def run_reprocess(
     cfg: Config, client: ImmichClient, *, commit: bool, limit: Optional[int],
     album: Optional[str], tag: Optional[str], asset_ids: list[str],
     include_human_edited: bool, skip_sourced: bool = False,
+    prune_tags: bool = False,
 ) -> int:
     if not cfg.vision.configured:
         print("[config] Reprocess needs VISION_ENDPOINT and VISION_MODEL set.", file=sys.stderr)
         return 2
+
+    # Loaded once for the whole run — a per-asset model load would dominate.
+    # None when WHISPER_ENABLED is false, which reproduces the pre-Whisper path.
+    transcriber = build_transcriber(cfg.whisper)
+    if transcriber is not None:
+        print(f"Transcripts     : {cfg.whisper.model} on {cfg.whisper.device} "
+              f"(video assets only)")
 
     label, assets, total = _resolve_scope(
         cfg, client, album=album, tag=tag, asset_ids=asset_ids, limit=limit
@@ -122,10 +169,14 @@ def run_reprocess(
         (t["id"] for t in known_tags if (t.get("value") or t.get("name")) == tax.review.tag_name), None
     )
 
+    tag_id_by_name = {
+        (t.get("value") or t.get("name")): t.get("id") for t in known_tags
+    }
+
     summary = {
         "scope": total, "reprocessed": 0, "unchanged": 0, "skipped_human": 0,
         "skipped_source": 0, "skipped_sourced": 0, "human_overridden": 0,
-        "failed": [], "verify_retries": 0,
+        "failed": [], "verify_retries": 0, "tags_pruned": 0, "tags_prune_stuck": 0,
     }
     moves: dict[str, int] = {}
     dry_probe: Optional[tuple[str, dict[str, Any]]] = None
@@ -151,7 +202,7 @@ def run_reprocess(
                 continue
 
             # Cache override: always classify within scope.
-            result = classify_asset(asset, cfg, vision, client)
+            result = classify_asset(asset, cfg, vision, client, transcriber)
 
             # Source filter: visibly skip assets whose detected source doesn't
             # match process_only (never silently dropped).
@@ -179,6 +230,13 @@ def run_reprocess(
                 known_tags=known_tags, known_albums=known_albums,
             )
 
+            # Stale tags: what we wrote last run that this run no longer wants.
+            # Computed even in dry-run so the report shows the real proposal.
+            planned_tag_values = [tp.normalized for tp in plan.tags]
+            stale = stale_tags_to_remove(
+                (cached.get("tags") if cached else []) or [], planned_tag_values, tax,
+            ) if prune_tags else []
+
             # --- DRY-RUN: print the planned move, write nothing ---
             if not commit:
                 if dry_probe is None:
@@ -189,6 +247,21 @@ def run_reprocess(
                     extra = " + needs-review tag" if tax.review.album_name in albums_to_remove else ""
                     print(f"  would remove from: {albums_to_remove}{extra}")
                 print(format_plan(plan, commit=False))
+                if result.get("transcript_available"):
+                    print(f"  transcript      : {result['transcript'].word_count} words "
+                          f"(fed to the classifier as a hint)")
+                elif result.get("transcript_error"):
+                    print(f"  transcript      : FAILED — {result['transcript_error']}")
+                if prune_tags:
+                    prior = (cached.get("tags") if cached else []) or []
+                    added = [t for t in planned_tag_values if t not in prior]
+                    if added:
+                        print(f"  tags ADD        : {added}")
+                    if stale:
+                        print(f"  tags REMOVE     : {stale}   "
+                              f"(ours from a prior run, not in the new plan)")
+                    if not added and not stale:
+                        print("  tags            : unchanged")
                 summary["reprocessed"] += 1
                 if is_no_op:
                     summary["unchanged"] += 1
@@ -233,6 +306,26 @@ def run_reprocess(
                 review_tag_removed = rok
                 ok = ok and rok
 
+            # Stale-tag prune. Deliberately LAST, after the add verified and
+            # after the album/needs-review removals — the same ordering the
+            # review-tag strip uses. execute_plan's clobber-repair loop unions
+            # the asset's CURRENT tags to restore them, so pruning any earlier
+            # would just see them handed straight back (IMGCLASS-11/15).
+            pruned: list[str] = []
+            prune_stuck: list[str] = []
+            for stale_tag in stale:
+                stale_id = tag_id_by_name.get(stale_tag)
+                if not stale_id:
+                    continue  # tag no longer exists server-side; nothing to do
+                pok, pretries = remove_tag_verified(stale_id, asset_id, cfg, client)
+                summary["verify_retries"] += pretries
+                if pok:
+                    pruned.append(stale_tag)
+                else:
+                    prune_stuck.append(stale_tag)
+            summary["tags_pruned"] += len(pruned)
+            summary["tags_prune_stuck"] += len(prune_stuck)
+
             cache.upsert(
                 asset_id=asset_id, content_hash=asset.get("checksum"),
                 category=result["category"], album=new_album,
@@ -252,6 +345,10 @@ def run_reprocess(
                     extras.append("removed " + ",".join(a for a, _ in removed))
                 if review_tag_removed is not None:
                     extras.append("needs-review " + ("removed" if review_tag_removed else "STUCK"))
+                if pruned:
+                    extras.append("pruned " + ",".join(pruned))
+                if prune_stuck:
+                    extras.append("prune STUCK " + ",".join(prune_stuck))
                 tail = ("; " + "; ".join(extras)) if extras else ""
                 print(f"  [OK ] {asset_id}  {move_key}  "
                       f"({add_outcome.present_count}/{add_outcome.intended_count} tags{tail})")
@@ -294,6 +391,10 @@ def run_reprocess(
         print(f"  skipped (already sourced): {summary['skipped_sourced']}")
     if include_human_edited:
         print(f"  human-edited OVERRIDDEN : {summary['human_overridden']}")
+    if prune_tags:
+        print(f"  stale tags pruned      : {summary['tags_pruned']}")
+        if summary["tags_prune_stuck"]:
+            print(f"  prune STUCK (kept)     : {summary['tags_prune_stuck']}")
     print(f"  failed                 : {len(summary['failed'])}  {summary['failed']}")
     print(f"  total verify-retries   : {summary['verify_retries']}")
     print("-" * 72)

@@ -158,6 +158,13 @@ class Config:
     # Set to 'archive' to deliberately classify archived assets instead.
     search_visibility: str = "timeline"
 
+    # --- Text role tuning (see app/summarise.py) ---
+    # Reasoning models spend max_tokens thinking before they answer, so a budget
+    # sized for the answer alone truncates them mid-thought.
+    text_max_tokens: int = 2000
+    # Append '/no_think' to disable the reasoning block on Qwen3-class models.
+    text_no_think: bool = False
+
     # --- Speech-to-text (see app/transcribe.py) ---
     # Defaults to a disabled WhisperConfig so existing callers and tests that
     # build a Config without it keep the exact pre-Whisper behaviour.
@@ -195,6 +202,8 @@ class Config:
             batch_group_size=_optional_int("BATCH_GROUP_SIZE", 25),
             batch_pause=_optional_float("BATCH_PAUSE", 0.0),
             search_visibility=_optional("SEARCH_VISIBILITY", "timeline"),
+            text_max_tokens=_optional_int("TEXT_MAX_TOKENS", 2000),
+            text_no_think=_optional_bool("TEXT_NO_THINK", False),
             whisper=WhisperConfig(
                 enabled=_optional_bool("WHISPER_ENABLED", False),
                 model=_optional("WHISPER_MODEL", "base"),
