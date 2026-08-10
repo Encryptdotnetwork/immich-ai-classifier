@@ -140,11 +140,45 @@ def _extract_frames(local_path: str, num_frames: int = NUM_VIDEO_FRAMES) -> list
         clip.close()
 
 
+def _transcribe_cached(
+    asset: dict[str, Any], local_path: str, transcriber: WhisperTranscriber,
+    store: Any = None,
+) -> tuple[Any, Optional[str], bool]:
+    """Return (transcript, error, was_cached).
+
+    Transcription is the most expensive local step, so a stored result is used
+    whenever the asset's checksum and the Whisper model both still match. A
+    cached "no usable speech" counts as a hit — establishing that cost a full
+    Whisper pass, and re-running it would burn the most time on exactly the
+    assets that produce nothing.
+    """
+    asset_id = asset.get("id")
+    content_hash = asset.get("checksum")
+
+    if store is not None and asset_id:
+        hit, cached = store.get(asset_id, content_hash, transcriber.model_name)
+        if hit:
+            return cached, None, True
+
+    try:
+        transcript = transcriber.transcribe(local_path)
+    except TranscribeError as exc:
+        # Deliberately NOT cached: a failure is usually transient (a locked
+        # file, a timeout) and caching it would make the asset permanently
+        # untranscribed until its checksum changed.
+        return None, str(exc), False
+
+    if store is not None and asset_id:
+        store.put(asset_id, content_hash, transcriber.model_name, transcript)
+    return transcript, None, False
+
+
 def gather_signals(
     asset: dict[str, Any],
     cfg: Config,
     client: ImmichClient,
     transcriber: Optional[WhisperTranscriber] = None,
+    transcript_store: Any = None,
 ) -> dict[str, Any]:
     """Build the model-ready signal bundle for one asset.
 
@@ -177,16 +211,16 @@ def gather_signals(
         "ocr_text": ocr_text,
         "transcript": None,
         "transcript_error": None,
+        "transcript_cached": False,
     }
 
     if asset_type == "VIDEO":
         local_path = _read_local_file(asset, cfg)
         signals["frames"] = _extract_frames(local_path)
         if transcriber is not None:
-            try:
-                signals["transcript"] = transcriber.transcribe(local_path)
-            except TranscribeError as exc:
-                signals["transcript_error"] = str(exc)
+            signals["transcript"], signals["transcript_error"], signals[
+                "transcript_cached"
+            ] = _transcribe_cached(asset, local_path, transcriber, transcript_store)
     elif _is_heic(asset):
         # No local read: the HEIC original is exactly what the model can't decode.
         signals["image_b64"] = _preview_b64(asset, client)

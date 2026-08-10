@@ -1,4 +1,4 @@
-"""Tests for the Whisper transcript stage (IMGCLASS-8).
+"""Tests for the Whisper transcript stage.
 
 Everything here runs WITHOUT faster-whisper installed and without touching
 Immich. The transcriber is stubbed; what is under test is the wiring, the
@@ -372,6 +372,82 @@ def test_no_speech_is_not_an_error(monkeypatch):
                                  _StubTranscriber(result=None))
     assert out["transcript"] is None
     assert out["transcript_error"] is None
+
+
+def test_cache_hit_skips_whisper_entirely(monkeypatch):
+    """The whole point of the store: no second Whisper pass on the same file."""
+    import app.signals as signals
+    from app.transcript_store import TranscriptStore
+    import tempfile
+
+    _patch_video_reads(monkeypatch)
+    store = TranscriptStore(tempfile.mkdtemp(prefix="sig-"))
+    t = Transcript("cached text", "en", 0.9, 5.0, model="base")
+    store.put("a9", "hash9", "base", t)
+
+    stub = _StubTranscriber(result=Transcript("FRESH", "en", 0.9, 5.0))
+    stub.model_name = "base"
+    asset = {"id": "a9", "type": "VIDEO", "checksum": "hash9"}
+    out = signals.gather_signals(asset, _cfg(), None, stub, store)
+
+    assert stub.calls == 0                    # Whisper never ran
+    assert out["transcript"].text == "cached text"
+    assert out["transcript_cached"] is True
+
+
+def test_cache_miss_transcribes_and_stores(monkeypatch):
+    import app.signals as signals
+    from app.transcript_store import TranscriptStore
+    import tempfile
+
+    _patch_video_reads(monkeypatch)
+    store = TranscriptStore(tempfile.mkdtemp(prefix="sig-"))
+    stub = _StubTranscriber(result=Transcript("fresh text", "en", 0.9, 5.0))
+    stub.model_name = "base"
+    asset = {"id": "a10", "type": "VIDEO", "checksum": "hash10"}
+
+    out = signals.gather_signals(asset, _cfg(), None, stub, store)
+    assert stub.calls == 1
+    assert out["transcript_cached"] is False
+    # ...and a second pass is now free.
+    out2 = signals.gather_signals(asset, _cfg(), None, stub, store)
+    assert stub.calls == 1
+    assert out2["transcript_cached"] is True
+
+
+def test_no_speech_result_is_cached_too(monkeypatch):
+    import app.signals as signals
+    from app.transcript_store import TranscriptStore
+    import tempfile
+
+    _patch_video_reads(monkeypatch)
+    store = TranscriptStore(tempfile.mkdtemp(prefix="sig-"))
+    stub = _StubTranscriber(result=None)
+    stub.model_name = "base"
+    asset = {"id": "a11", "type": "VIDEO", "checksum": "h"}
+
+    signals.gather_signals(asset, _cfg(), None, stub, store)
+    signals.gather_signals(asset, _cfg(), None, stub, store)
+    assert stub.calls == 1  # silent clips are the worst ones to re-run
+
+
+def test_transcription_failure_is_not_cached(monkeypatch):
+    """A transient error must not permanently mark an asset untranscribed."""
+    import app.signals as signals
+    from app.transcript_store import TranscriptStore
+    import tempfile
+
+    _patch_video_reads(monkeypatch)
+    store = TranscriptStore(tempfile.mkdtemp(prefix="sig-"))
+    stub = _StubTranscriber(error="ffmpeg exploded")
+    stub.model_name = "base"
+    asset = {"id": "a12", "type": "VIDEO", "checksum": "h"}
+
+    out = signals.gather_signals(asset, _cfg(), None, stub, store)
+    assert "ffmpeg exploded" in out["transcript_error"]
+    assert store.stats()["total"] == 0
+    signals.gather_signals(asset, _cfg(), None, stub, store)
+    assert stub.calls == 2  # retried, not written off
 
 
 def test_transcriber_is_optional(monkeypatch):

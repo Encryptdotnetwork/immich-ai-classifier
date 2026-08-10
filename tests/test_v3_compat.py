@@ -1,4 +1,4 @@
-"""Regression tests for the Immich 3.0 breaking changes (IMGCLASS-16).
+"""Regression tests for the Immich 3.0 breaking changes.
 
 Both bugs were silent: neither raised, both just quietly did the wrong thing.
 These tests assert on the request bodies we send and on the refusal behaviour,

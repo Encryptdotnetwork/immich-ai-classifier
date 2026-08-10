@@ -25,6 +25,7 @@ from .paths import translate_path
 from .signals import SignalError, find_ocr_text
 from .taxonomy import TaxonomyError, load_taxonomy
 from .transcribe import build_transcriber
+from .transcript_store import build_transcript_store
 from .vision import VisionClient, VisionError
 from .writer import build_plan, execute_plan, format_outcome, format_plan
 
@@ -154,7 +155,7 @@ def _run_classify(cfg: Config, client: ImmichClient, asset_id: str, commit: bool
     try:
         result = classify_asset(
             asset, cfg, VisionClient(cfg.vision), client,
-            build_transcriber(cfg.whisper),
+            build_transcriber(cfg.whisper), build_transcript_store(cfg),
         )
     except (VisionError, SignalError) as exc:
         print(f"!! {exc}", file=sys.stderr)

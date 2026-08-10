@@ -38,6 +38,7 @@ from .immich_client import ImmichClient
 from .signals import SignalError
 from .taxonomy import load_taxonomy
 from .transcribe import build_transcriber
+from .transcript_store import build_transcript_store
 from .vision import VisionClient, VisionError
 from .writer import (
     build_plan,
@@ -59,8 +60,8 @@ def stale_tags_to_remove(
     """Tags to strip because the new plan no longer wants them.
 
     Two scopes, both of which must be able to prove authorship before removing
-    anything. IMGCLASS-15 was a silent tag-loss incident, so the rule is that
-    this tool only removes what it can show is its own.
+    anything. A past bug in this tool silently destroyed tags, so the rule is
+    that it only removes what it can show is its own.
 
     CACHE-SCOPED (default). Candidates are the tags cache.db records us writing
     last run. Provably ours, but the cache only holds the MOST RECENT run, so
@@ -80,7 +81,7 @@ def stale_tags_to_remove(
       - the review tag: reprocess strips that separately, after the album move
       - source:<platform>: expensive to derive, needs a frontier model to get
         right, and a weak local pass routinely fails to re-emit it. Losing these
-        was the exact damage in IMGCLASS-15.
+        is exactly what a past tag-loss bug destroyed.
       - anything in keep_tags: the explicit escape hatch for hand-added tags
     """
     protected = {tax.marker_tag, tax.review.tag_name, *keep_tags}
@@ -169,9 +170,14 @@ def run_reprocess(
     # Loaded once for the whole run — a per-asset model load would dominate.
     # None when WHISPER_ENABLED is false, which reproduces the pre-Whisper path.
     transcriber = build_transcriber(cfg.whisper)
+    transcript_store = build_transcript_store(cfg)
     if transcriber is not None:
+        stored = transcript_store.stats() if transcript_store else {}
         print(f"Transcripts     : {cfg.whisper.model} on {cfg.whisper.device} "
               f"(video assets only)")
+        if stored:
+            print(f"  store         : {stored['total']} cached "
+                  f"({stored['with_speech']} with speech, {stored['words']:,} words)")
     label, assets, total = _resolve_scope(
         cfg, client, album=album, tag=tag, asset_ids=asset_ids, limit=limit,
         asset_type=asset_type,
@@ -249,7 +255,9 @@ def run_reprocess(
                 continue
 
             # Cache override: always classify within scope.
-            result = classify_asset(asset, cfg, vision, client, transcriber)
+            result = classify_asset(
+                asset, cfg, vision, client, transcriber, transcript_store,
+            )
 
             # Source filter: visibly skip assets whose detected source doesn't
             # match process_only (never silently dropped).
@@ -372,7 +380,7 @@ def run_reprocess(
             # after the album/needs-review removals — the same ordering the
             # review-tag strip uses. execute_plan's clobber-repair loop unions
             # the asset's CURRENT tags to restore them, so pruning any earlier
-            # would just see them handed straight back (IMGCLASS-11/15).
+            # would just see them handed straight back.
             pruned: list[str] = []
             prune_stuck: list[str] = []
             for stale_tag in stale:
@@ -465,5 +473,8 @@ def run_reprocess(
                   f"(proposed; --commit to act)")
     print(f"  failed                 : {len(summary['failed'])}  {summary['failed']}")
     print(f"  total verify-retries   : {summary['verify_retries']}")
+    if transcript_store is not None:
+        print(f"  transcripts (cache)    : {transcript_store.hits} hit, "
+              f"{transcript_store.misses} transcribed")
     print("-" * 72)
     return 1 if summary["failed"] else 0

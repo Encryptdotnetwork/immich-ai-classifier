@@ -16,7 +16,7 @@ run would. It touches no Immich write endpoint at all — there is no --commit.
 
 Usage:
     python -m app.transcript_spike --limit 20
-    python -m app.transcript_spike --album "TikTok.Saved" --limit 50
+    python -m app.transcript_spike --album "Saved" --limit 50
     python -m app.transcript_spike --asset <asset_id>
 """
 
@@ -35,6 +35,7 @@ from .immich_client import ImmichClient
 from .signals import SignalError, gather_signals
 from .summarise import SummariseError, TextClient, summarise_transcript
 from .transcribe import TranscribeError, build_transcriber
+from .transcript_store import build_transcript_store
 
 # Description budget candidates, used only to report how many transcripts WOULD
 # fit if the "everything in the description field" option were taken.
@@ -85,6 +86,9 @@ def run(
     client = ImmichClient(cfg)
     transcriber = build_transcriber(cfg.whisper)
     assert transcriber is not None  # guarded above
+    # The spike populates the same store the real runs read, so a spike is
+    # never wasted work — it warms the cache for the batch that follows.
+    store = build_transcript_store(cfg)
 
     # The text role is optional: a run without it still yields transcripts and
     # their length distribution, which is most of what the storage decision needs.
@@ -128,7 +132,7 @@ def run(
             }
 
             try:
-                signals = gather_signals(asset, cfg, client, transcriber)
+                signals = gather_signals(asset, cfg, client, transcriber, store)
             except SignalError as exc:
                 record["error"] = f"signals: {exc}"
                 counts["failed"] += 1
@@ -177,6 +181,9 @@ def run(
             if pause:
                 time.sleep(pause)
 
+    if store is not None:
+        counts["cache_hits"] = store.hits
+        counts["cache_misses"] = store.misses
     _report(counts, char_lengths, word_counts, out_path, time.time() - started)
     return 0
 
@@ -208,6 +215,9 @@ def _report(
         print(f"  !! {counts['transcribed'] - accounted} transcript(s) unaccounted for")
     print(f"  elapsed           : {elapsed:.1f}s "
           f"({elapsed / max(counts['total'], 1):.1f}s per video)")
+    if counts.get("cache_hits") or counts.get("cache_misses"):
+        print(f"  transcript cache  : {counts.get('cache_hits', 0)} hit, "
+              f"{counts.get('cache_misses', 0)} transcribed")
 
     if char_lengths:
         print("\n  Transcript length (characters)")

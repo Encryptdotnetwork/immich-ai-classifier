@@ -25,6 +25,7 @@ from .immich_client import ImmichClient
 from .signals import SignalError
 from .taxonomy import Taxonomy, load_taxonomy
 from .transcribe import build_transcriber
+from .transcript_store import build_transcript_store
 from .vision import VisionClient, VisionError
 from .writer import Plan, build_plan, execute_plans_batch, format_plan
 
@@ -268,6 +269,7 @@ def run_batch(
     # Loaded once for the whole run; None when WHISPER_ENABLED is false, which
     # reproduces the exact pre-Whisper behaviour.
     transcriber = build_transcriber(cfg.whisper)
+    transcript_store = build_transcript_store(cfg)
     if transcriber is not None:
         print(f"Transcripts     : {cfg.whisper.model} on {cfg.whisper.device} "
               f"(video assets only)")
@@ -346,7 +348,9 @@ def run_batch(
                 print(f"  [skip] {asset_id}  already source-tagged — left for a remote-model pass")
                 continue
 
-            result = classify_asset(asset, cfg, vision, client, transcriber)
+            result = classify_asset(
+                asset, cfg, vision, client, transcriber, transcript_store,
+            )
 
             # Source filter: visibly skip assets whose detected source doesn't
             # match process_only (never silently dropped).

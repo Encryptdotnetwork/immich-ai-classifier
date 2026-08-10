@@ -1,7 +1,7 @@
 """Tests for cache-scoped stale tag removal (--prune-tags).
 
-This is the only destructive tag operation in the tool, and IMGCLASS-15 was a
-silent tag-loss incident. So these tests are written from the angle of "what
+This is the only destructive tag operation in the tool, and a past bug here
+silently destroyed tags. So these tests are written from the angle of "what
 must NEVER be removed" rather than "what gets removed".
 """
 
@@ -49,7 +49,7 @@ def test_human_added_tags_are_never_touched():
 
 
 def test_source_tags_survive_even_when_cached_and_unplanned():
-    """The exact damage from IMGCLASS-15. Never prune these."""
+    """Exactly what a past tag-loss bug destroyed. Never prune these."""
     out = stale_tags_to_remove(
         ["source:tiktok", "talk"], ["geopolitics"], TAX,
     )
@@ -82,7 +82,7 @@ def test_tag_still_in_the_new_plan_is_kept():
 
 
 def test_the_real_world_case():
-    """Dan's asset 34a363da: frame-derived tags replaced by transcript-derived."""
+    """A real asset: frame-derived tags replaced by transcript-derived ones."""
     cached = ["talk", "presentation", "youtube", "source:tiktok", "ai-classified"]
     planned = ["geopolitics", "richard-day", "population-control",
                "source:tiktok", "ai-classified"]
@@ -109,8 +109,8 @@ def test_identical_plan_removes_nothing():
 
 # --- marker-scoped prune (--prune-all-tags) -------------------------------
 
-# Dan's real asset c23f7647 after the cache-scoped run: the residue the cache
-# could not see, alongside the tags the transcript produced.
+# A real asset after a cache-scoped run: the residue the cache could not see,
+# alongside the tags the transcript produced.
 LIVE = ["censorship", "source:tiktok", "postmodernism", "social-commentary",
         "animation", "free-speech", "political-commentary", "freedom-of-speech",
         "ai-classified", "politics"]

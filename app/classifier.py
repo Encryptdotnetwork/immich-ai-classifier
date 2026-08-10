@@ -145,6 +145,7 @@ def classify_asset(
     vision_client: Any,
     client: Any,
     transcriber: Any = None,
+    transcript_store: Any = None,
 ) -> dict[str, Any]:
     """Gather signals, run the vision model, parse the result. NO writes.
 
@@ -153,7 +154,7 @@ def classify_asset(
     ``transcriber`` is the optional WhisperTranscriber; None keeps the exact
     pre-Whisper behaviour.
     """
-    signals = gather_signals(asset, cfg, client, transcriber)
+    signals = gather_signals(asset, cfg, client, transcriber, transcript_store)
     image_bytes = _select_image_bytes(signals)
     ocr_text = signals.get("ocr_text")
     transcript = signals.get("transcript")
@@ -173,4 +174,5 @@ def classify_asset(
     result["transcript"] = transcript
     result["transcript_available"] = bool(transcript_text)
     result["transcript_error"] = signals.get("transcript_error")
+    result["transcript_cached"] = signals.get("transcript_cached", False)
     return result
