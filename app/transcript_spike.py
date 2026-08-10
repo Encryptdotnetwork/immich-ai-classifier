@@ -165,6 +165,7 @@ def run(
                         counts["summary_failed"] = counts.get("summary_failed", 0) + 1
                 except SummariseError as exc:
                     record["error"] = f"summarise: {exc}"
+                    counts["summary_error"] = counts.get("summary_error", 0) + 1
 
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
             preview = (record.get("summary") or {}).get("summary") or transcript.text[:80]
@@ -196,8 +197,15 @@ def _report(
     print(f"  failed            : {counts['failed']}")
     print(f"  summarised ok     : {counts['summarised']}")
     if counts.get("summary_failed"):
-        print(f"  summary FAILED    : {counts['summary_failed']}  "
+        print(f"  summary unparsed  : {counts['summary_failed']}  "
               f"(model reply kept as .summary.raw in the JSONL)")
+    if counts.get("summary_error"):
+        print(f"  summary ERRORED   : {counts['summary_error']}  "
+              f"(endpoint raised; reason in .error in the JSONL)")
+    accounted = (counts.get("summarised", 0) + counts.get("summary_failed", 0)
+                 + counts.get("summary_error", 0))
+    if counts["transcribed"] and accounted != counts["transcribed"]:
+        print(f"  !! {counts['transcribed'] - accounted} transcript(s) unaccounted for")
     print(f"  elapsed           : {elapsed:.1f}s "
           f"({elapsed / max(counts['total'], 1):.1f}s per video)")
 

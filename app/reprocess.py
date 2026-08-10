@@ -177,6 +177,7 @@ def run_reprocess(
         "scope": total, "reprocessed": 0, "unchanged": 0, "skipped_human": 0,
         "skipped_source": 0, "skipped_sourced": 0, "human_overridden": 0,
         "failed": [], "verify_retries": 0, "tags_pruned": 0, "tags_prune_stuck": 0,
+        "tags_would_prune": 0,
     }
     moves: dict[str, int] = {}
     dry_probe: Optional[tuple[str, dict[str, Any]]] = None
@@ -253,13 +254,24 @@ def run_reprocess(
                 elif result.get("transcript_error"):
                     print(f"  transcript      : FAILED — {result['transcript_error']}")
                 if prune_tags:
-                    prior = (cached.get("tags") if cached else []) or []
-                    added = [t for t in planned_tag_values if t not in prior]
+                    # ADD is measured against the asset's ACTUAL current tags,
+                    # not the cache. The cache only knows what we wrote last
+                    # run, so diffing against it reported things like
+                    # 'source:tiktok' as an addition when the asset already
+                    # carried it. REMOVE still uses the cache, deliberately —
+                    # that restriction is the safety property.
+                    live_tags = {
+                        (t.get("value") or t.get("name"))
+                        for t in (client.get_asset(asset_id).get("tags") or [])
+                        if isinstance(t, dict)
+                    }
+                    added = [t for t in planned_tag_values if t not in live_tags]
                     if added:
                         print(f"  tags ADD        : {added}")
                     if stale:
                         print(f"  tags REMOVE     : {stale}   "
                               f"(ours from a prior run, not in the new plan)")
+                        summary["tags_would_prune"] += len(stale)
                     if not added and not stale:
                         print("  tags            : unchanged")
                 summary["reprocessed"] += 1
@@ -392,9 +404,15 @@ def run_reprocess(
     if include_human_edited:
         print(f"  human-edited OVERRIDDEN : {summary['human_overridden']}")
     if prune_tags:
-        print(f"  stale tags pruned      : {summary['tags_pruned']}")
-        if summary["tags_prune_stuck"]:
-            print(f"  prune STUCK (kept)     : {summary['tags_prune_stuck']}")
+        if commit:
+            print(f"  stale tags pruned      : {summary['tags_pruned']}")
+            if summary["tags_prune_stuck"]:
+                print(f"  prune STUCK (kept)     : {summary['tags_prune_stuck']}")
+        else:
+            # Saying "pruned: 0" under a dry-run read as "found nothing to
+            # prune", when the per-asset output above had just listed plenty.
+            print(f"  stale tags TO PRUNE    : {summary['tags_would_prune']}  "
+                  f"(proposed; --commit to act)")
     print(f"  failed                 : {len(summary['failed'])}  {summary['failed']}")
     print(f"  total verify-retries   : {summary['verify_retries']}")
     print("-" * 72)
